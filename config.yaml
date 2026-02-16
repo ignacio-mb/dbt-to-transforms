@@ -1,0 +1,88 @@
+# dbt-to-metabase migration configuration
+# Copy this to config.yaml and fill in your values.
+
+github:
+  repo: "ignacio-mb/dbt-shop-analytics"       # GitHub repo (org/repo format)
+  branch: "main"                        # Branch to read dbt models from
+  # token: "ghp_..."                    # Or set GITHUB_TOKEN env var
+  subdirectory: ""                      # For monorepos: path to dbt project root
+
+metabase:
+  url: "http://localhost:3000"   # Metabase instance URL
+  api_key: "mb_KZeRmBYszEmsD1fVvwzUgsBu7IehVdYQNsvPrhIYbfY="                   # Or set METABASE_API_KEY env var
+  username: "admin@example.com"       # Or set METABASE_USERNAME env var
+  password: "Metabase123"                     # Or set METABASE_PASSWORD env var
+  database_id: 2                     # Target database ID in Metabase
+  default_schema: "analytics"           # Default schema for transform output tables
+
+remote_sync:
+  enabled: true                        # Set true to push transforms to git after migration
+  github_repo: "ignacio-mb/local-metabase-remote-sync"
+  branch: "main"
+
+# ──────────────────────────────────────────────
+# Schema mappings
+# Map dbt folder paths → Metabase target schemas
+# ──────────────────────────────────────────────
+schema_mappings:
+  - dbt_folder_pattern: "staging/*"
+    metabase_schema: "staging"
+  - dbt_folder_pattern: "intermediate/*"
+    metabase_schema: "intermediate"
+  - dbt_folder_pattern: "marts/*"
+    metabase_schema: "marts"
+  - dbt_folder_pattern: "marts/finance"
+    metabase_schema: "marts_finance"
+
+# ──────────────────────────────────────────────
+# Tag mappings
+# Map dbt tags → Metabase transform tags
+# Unmapped dbt tags are passed through as-is.
+# ──────────────────────────────────────────────
+tag_mappings:
+  - dbt_tag: "nightly"
+    metabase_tag: "daily"
+  - dbt_tag: "hourly_refresh"
+    metabase_tag: "hourly"
+
+# Default tags applied to models with no tags
+default_tags:
+  - "daily"
+
+# ──────────────────────────────────────────────
+# Jobs
+# Metabase transform jobs to create
+# ──────────────────────────────────────────────
+jobs:
+  - name: "Nightly dbt transforms"
+    schedule: "0 0 0 * * ?"              # Midnight every day (cron)
+    tags: ["daily"]
+  - name: "Hourly refresh"
+    schedule: "0 0 * * * ?"              # Top of every hour (cron)
+    tags: ["hourly"]
+  - name: "Weekly aggregations"
+    schedule: "0 2 * * 1 ?"              # Monday at 2 AM
+    tags: ["weekly"]
+
+# ──────────────────────────────────────────────
+# Migration settings
+# ──────────────────────────────────────────────
+
+# Prefix for Metabase folder hierarchy (e.g. "dbt/staging/orders")
+folder_prefix: "dbt"
+
+# Preserve dbt folder structure as Metabase folders
+preserve_folder_structure: true
+
+# Dry run: generate plan without executing
+dry_run: false
+
+# How to handle existing transforms with the same name:
+# "skip" — leave existing, don't overwrite
+# "replace" — delete existing and recreate
+# "error" — fail if any exist
+on_conflict: "skip"
+
+# Model filters (glob patterns)
+# include_models: ["stg_*", "fct_*", "dim_*"]
+# exclude_models: ["*_tmp", "*_deprecated"]
