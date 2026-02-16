@@ -1,0 +1,2 @@
+[console_scripts]
+dbt-to-metabase = dbt_to_metabase.cli:main
