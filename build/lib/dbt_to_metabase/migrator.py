@@ -8,7 +8,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .config import MigrationConfig
 from .dbt_parser import GitHubDbtParser
@@ -40,6 +40,7 @@ class Migrator:
         self.client = MetabaseClient(config.metabase)
         self.project = None  # type: Optional[DbtProject]
         self.plan = None  # type: Optional[MigrationPlan]
+        self.execution_layers = []  # type: List[List[str]]
 
     def run(self):
         # type: () -> MigrationPlan
@@ -47,10 +48,10 @@ class Migrator:
         logger.info("dbt -> Metabase Transforms Migration")
         logger.info("=" * 60)
 
-        logger.info("Step 1/5: Parsing dbt project from GitHub...")
+        logger.info("Step 1/6: Parsing dbt project from GitHub...")
         self.project = self.parser.parse()
 
-        logger.info("Step 2/5: Resolving model dependencies...")
+        logger.info("Step 2/6: Resolving model dependencies...")
         resolver = DependencyResolver(self.project)
         try:
             execution_order = resolver.resolve(exclude_ephemeral=True)
@@ -58,12 +59,13 @@ class Migrator:
             raise MigrationError("Cannot migrate: {}".format(e))
 
         layers = resolver.get_execution_layers()
+        self.execution_layers = layers
         logger.info(
             "Execution plan: %d models in %d layers",
             len(execution_order), len(layers),
         )
 
-        logger.info("Step 3/5: Building migration plan...")
+        logger.info("Step 3/6: Building migration plan...")
         self.plan = self._build_plan(execution_order)
         self._log_plan_summary()
 
@@ -71,14 +73,17 @@ class Migrator:
             logger.info("DRY RUN -- skipping execution. Plan saved.")
             return self.plan
 
-        logger.info("Step 4/5: Executing migration plan...")
+        logger.info("Step 4/6: Executing migration plan...")
         self._execute_plan()
 
+        logger.info("Step 5/6: Running transforms in dependency order...")
+        self._run_transforms()
+
         if self.config.remote_sync.enabled:
-            logger.info("Step 5/5: Triggering Metabase remote sync...")
+            logger.info("Step 6/6: Triggering Metabase remote sync...")
             self._trigger_remote_sync()
         else:
-            logger.info("Step 5/5: Remote sync not enabled, skipping.")
+            logger.info("Step 6/6: Remote sync not enabled, skipping.")
 
         logger.info("=" * 60)
         logger.info("Migration complete!")
@@ -339,6 +344,71 @@ class Migrator:
                     "Failed to create job '{}': {}".format(job.name, e)
                 )
 
+    def _run_transforms(self):
+        # type: () -> None
+        assert self.plan is not None
+
+        # Build name -> transform_id map for created transforms
+        transform_ids = {}  # type: Dict[str, int]
+        for t in self.plan.transforms:
+            if t.transform_id:
+                transform_ids[t.name] = t.transform_id
+
+        if not transform_ids:
+            logger.warning("No transforms to run (none were created successfully)")
+            return
+
+        total_layers = len(self.execution_layers)
+        for layer_idx, layer in enumerate(self.execution_layers):
+            layer_transforms = [
+                (name, transform_ids[name])
+                for name in layer if name in transform_ids
+            ]
+
+            if not layer_transforms:
+                continue
+
+            logger.info(
+                "Layer %d/%d: Running %d transforms: %s",
+                layer_idx + 1, total_layers,
+                len(layer_transforms),
+                ", ".join(name for name, _ in layer_transforms),
+            )
+
+            # Start all transforms in this layer
+            running = []  # type: List[tuple]
+            for name, tid in layer_transforms:
+                try:
+                    result = self.client.run_transform(tid)
+                    run_id = result.get("id")
+                    if run_id:
+                        running.append((name, tid, run_id))
+                    else:
+                        logger.info("Transform '%s' started (no run_id returned)", name)
+                except MetabaseApiError as e:
+                    self.plan.warnings.append(
+                        "[{}] Failed to run transform: {}".format(name, e)
+                    )
+                    logger.error("Failed to run transform '%s': %s", name, e)
+
+            # Wait for all transforms in this layer to complete
+            for name, tid, run_id in running:
+                try:
+                    run = self.client.wait_for_run(tid, run_id, timeout=600)
+                    status = run.get("status", "unknown")
+                    logger.info(
+                        "Transform '%s' completed with status: %s", name, status
+                    )
+                except (MetabaseApiError, TimeoutError) as e:
+                    self.plan.warnings.append(
+                        "[{}] Transform run failed: {}".format(name, e)
+                    )
+                    logger.error("Transform '%s' run failed: %s", name, e)
+
+            logger.info("Layer %d/%d complete", layer_idx + 1, total_layers)
+
+        logger.info("All transforms executed")
+
     def _get_existing_transforms(self):
         # type: () -> Dict[str, dict]
         try:
@@ -415,3 +485,381 @@ class Migrator:
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
         logger.info("Plan exported to %s", path)
+
+    # ──────────────────────────────────────────────
+    # Remap command
+    # ──────────────────────────────────────────────
+
+    def run_remap(self):
+        # type: () -> Dict[str, Any]
+        """
+        Remap Metabase cards from dbt model tables to Metabase transform tables.
+
+        Steps:
+        1. List all tables in the target database
+        2. Build table ID mapping: dbt table → transform table (by name)
+        3. Find all cards referencing dbt tables
+        4. Update each card's query to reference transform tables instead
+        """
+        logger.info("=" * 60)
+        logger.info("dbt -> Metabase Transforms: REMAP")
+        logger.info("=" * 60)
+
+        remap_map = self.config.remap_schema_map
+        if not remap_map:
+            raise MigrationError(
+                "remap_schema_map required. Map dbt schemas to transform schemas, e.g.:\n"
+                "remap_schema_map:\n"
+                "  dbt_models_staging: transforms_staging\n"
+                "  dbt_models_marts: transforms_marts"
+            )
+
+        results = {
+            "table_mappings": [],
+            "cards_updated": [],
+            "cards_skipped": [],
+            "warnings": [],
+        }  # type: Dict[str, Any]
+
+        # Step 1: Get all tables from Metabase for this database
+        logger.info("Step 1/3: Building table ID mapping...")
+        database_id = self.config.metabase.database_id
+
+        try:
+            # Sync database first to ensure tables are up to date
+            self.client.sync_database(database_id)
+            import time as _time
+            logger.info("Waiting for sync to complete...")
+            _time.sleep(5)
+        except MetabaseApiError as e:
+            logger.warning("Database sync failed (continuing anyway): %s", e)
+
+        tables = self.client.list_tables(database_id)
+        logger.info("Found %d tables in database %d", len(tables), database_id)
+
+        # Build schema.table_name -> table_id lookup
+        table_lookup = {}  # type: Dict[str, int]
+        for t in tables:
+            schema = t.get("schema", "")
+            name = t.get("name", "")
+            table_id = t.get("id")
+            if schema and name and table_id:
+                key = "{}.{}".format(schema, name)
+                table_lookup[key] = table_id
+
+        # Build old_table_id -> new_table_id mapping
+        table_id_map = {}  # type: Dict[int, int]
+        for dbt_schema, transform_schema in remap_map.items():
+            # Find all tables in the dbt schema
+            dbt_tables = [
+                t for t in tables
+                if t.get("schema", "") == dbt_schema
+            ]
+
+            for dt in dbt_tables:
+                old_id = dt.get("id")
+                table_name = dt.get("name", "")
+                new_key = "{}.{}".format(transform_schema, table_name)
+                new_id = table_lookup.get(new_key)
+
+                if old_id and new_id:
+                    table_id_map[old_id] = new_id
+                    results["table_mappings"].append({
+                        "table_name": table_name,
+                        "old_id": old_id,
+                        "new_id": new_id,
+                        "old_schema": dbt_schema,
+                        "new_schema": transform_schema,
+                    })
+                    logger.info(
+                        "Mapped %s.%s (id=%d) -> %s.%s (id=%d)",
+                        dbt_schema, table_name, old_id,
+                        transform_schema, table_name, new_id,
+                    )
+                elif old_id and not new_id:
+                    msg = "No matching transform table for {}.{} (looked for {})".format(
+                        dbt_schema, table_name, new_key
+                    )
+                    results["warnings"].append(msg)
+                    logger.warning(msg)
+
+        if not table_id_map:
+            raise MigrationError(
+                "No table mappings found. Check that transform tables exist "
+                "and remap_schema_map is correct."
+            )
+
+        logger.info("Built %d table ID mappings", len(table_id_map))
+
+        # Build field ID mapping: old_field_id -> new_field_id (matched by column name)
+        field_id_map = {}  # type: Dict[int, int]
+        for old_table_id, new_table_id in table_id_map.items():
+            try:
+                old_fields = self.client.get_table_fields(old_table_id)
+                new_fields = self.client.get_table_fields(new_table_id)
+            except MetabaseApiError as e:
+                msg = "Failed to get fields for table {} or {}: {}".format(
+                    old_table_id, new_table_id, e
+                )
+                results["warnings"].append(msg)
+                logger.warning(msg)
+                continue
+
+            new_by_name = {}  # type: Dict[str, int]
+            for f in new_fields:
+                fname = f.get("name", "")
+                fid = f.get("id")
+                if fname and fid:
+                    new_by_name[fname] = fid
+
+            for f in old_fields:
+                old_fid = f.get("id")
+                fname = f.get("name", "")
+                new_fid = new_by_name.get(fname)
+                if old_fid and new_fid:
+                    field_id_map[old_fid] = new_fid
+
+        logger.info("Built %d field ID mappings", len(field_id_map))
+
+        # Also build schema name map for native SQL rewriting
+        schema_name_map = {}  # type: Dict[str, str]
+        for dbt_schema, transform_schema in remap_map.items():
+            schema_name_map[dbt_schema] = transform_schema
+
+        # Step 2: Find and update all cards
+        logger.info("Step 2/3: Scanning and updating cards...")
+        try:
+            cards = self.client.list_cards()
+        except MetabaseApiError as e:
+            raise MigrationError("Failed to list cards: {}".format(e))
+
+        logger.info("Found %d cards to scan", len(cards))
+
+        for card in cards:
+            card_id = card.get("id")
+            card_name = card.get("name", "unknown")
+            dataset_query = card.get("dataset_query", {})
+
+            if not dataset_query:
+                continue
+
+            # Skip Metabase internal analytics cards
+            card_db = dataset_query.get("database")
+            if card_db != database_id:
+                continue
+
+            query_type = dataset_query.get("type")
+            lib_type = dataset_query.get("lib/type", "")
+            changed = False
+
+            if query_type == "query" or lib_type == "mbql/query":
+                # MBQL query — update source-table, field refs, and joins
+                changed = self._remap_mbql_query(dataset_query, table_id_map, field_id_map)
+            elif query_type == "native":
+                # Native SQL — replace schema references
+                changed = self._remap_native_query(dataset_query, schema_name_map)
+            else:
+                # Unknown type but might still have stages (lib/type mbql)
+                # Try field remapping anyway
+                if field_id_map and self._remap_field_ids(dataset_query, field_id_map):
+                    changed = True
+
+            if changed:
+                try:
+                    self.client.update_card(card_id, dataset_query=dataset_query)
+                    logger.info("Updated card '%s' (id=%d)", card_name, card_id)
+                    results["cards_updated"].append({
+                        "id": card_id,
+                        "name": card_name,
+                        "type": query_type or lib_type,
+                    })
+                except MetabaseApiError as e:
+                    msg = "[card {}] Failed to update: {}".format(card_name, e)
+                    results["warnings"].append(msg)
+                    logger.error(msg)
+            else:
+                results["cards_skipped"].append({
+                    "id": card_id,
+                    "name": card_name,
+                })
+
+        # Step 3: Update dashboard cards that have custom queries
+        logger.info("Step 3/3: Scanning dashboards for inline card overrides...")
+        try:
+            dashboards = self.client.list_dashboards()
+        except MetabaseApiError as e:
+            logger.warning("Failed to list dashboards: %s", e)
+            dashboards = []
+
+        for dash_summary in dashboards:
+            dash_id = dash_summary.get("id")
+            if not dash_id:
+                continue
+
+            try:
+                dash = self.client.get_dashboard(dash_id)
+            except MetabaseApiError:
+                continue
+
+            dash_changed = False
+            dashcards = dash.get("dashcards", [])
+
+            for dc in dashcards:
+                # Dashboard cards can override queries via card_overrides or parameter_mappings
+                card_data = dc.get("card", {})
+                if not card_data:
+                    continue
+
+                dq = card_data.get("dataset_query", {})
+                if not dq:
+                    continue
+
+                qt = dq.get("type")
+                lt = dq.get("lib/type", "")
+                if qt == "query" or lt == "mbql/query":
+                    if self._remap_mbql_query(dq, table_id_map, field_id_map):
+                        dash_changed = True
+                elif qt == "native":
+                    if self._remap_native_query(dq, schema_name_map):
+                        dash_changed = True
+
+            if dash_changed:
+                try:
+                    self.client.update_dashboard_card(dash_id, dashcards)
+                    logger.info(
+                        "Updated dashboard '%s' (id=%d)",
+                        dash_summary.get("name", "unknown"), dash_id,
+                    )
+                except MetabaseApiError as e:
+                    msg = "[dashboard {}] Failed to update: {}".format(
+                        dash_summary.get("name", "unknown"), e
+                    )
+                    results["warnings"].append(msg)
+                    logger.error(msg)
+
+        logger.info("=" * 60)
+        logger.info("Remap complete!")
+        logger.info("=" * 60)
+        return results
+
+    def _remap_mbql_query(self, dataset_query, table_id_map, field_id_map=None):
+        # type: (dict, Dict[int, int], Optional[Dict[int, int]]) -> bool
+        """Walk an MBQL dataset_query and replace source-table and field IDs. Returns True if changed."""
+        if field_id_map is None:
+            field_id_map = {}
+
+        changed = False
+
+        # New format: stages array (Metabase v1.50+)
+        stages = dataset_query.get("stages", [])
+        for stage in stages:
+            # Remap source-table in each stage
+            source_table = stage.get("source-table")
+            if isinstance(source_table, int) and source_table in table_id_map:
+                stage["source-table"] = table_id_map[source_table]
+                changed = True
+
+            # Remap joins in each stage
+            for join in stage.get("joins", []):
+                jt = join.get("source-table")
+                if isinstance(jt, int) and jt in table_id_map:
+                    join["source-table"] = table_id_map[jt]
+                    changed = True
+
+                # Joins can also have nested stages
+                for join_stage in join.get("stages", []):
+                    jst = join_stage.get("source-table")
+                    if isinstance(jst, int) and jst in table_id_map:
+                        join_stage["source-table"] = table_id_map[jst]
+                        changed = True
+
+        # Old format: query object (pre-v1.50)
+        query = dataset_query.get("query", {})
+        if query:
+            source_table = query.get("source-table")
+            if isinstance(source_table, int) and source_table in table_id_map:
+                query["source-table"] = table_id_map[source_table]
+                changed = True
+
+            for join in query.get("joins", []):
+                jt = join.get("source-table")
+                if isinstance(jt, int) and jt in table_id_map:
+                    join["source-table"] = table_id_map[jt]
+                    changed = True
+
+            source_query = query.get("source-query")
+            if isinstance(source_query, dict):
+                inner_dq = {"query": source_query}
+                if self._remap_mbql_query(inner_dq, table_id_map, field_id_map):
+                    query["source-query"] = inner_dq["query"]
+                    changed = True
+
+        # Remap field IDs throughout the entire structure
+        if field_id_map and self._remap_field_ids(dataset_query, field_id_map):
+            changed = True
+
+        return changed
+
+    def _remap_field_ids(self, obj, field_id_map):
+        # type: (Any, Dict[int, int]) -> bool
+        """Recursively walk a data structure and remap field ID references.
+
+        Field refs look like: ['field', {...opts...}, <int_field_id>]
+        or: ['field', {...opts...}, <int_field_id>] with field ID as the last element.
+        Also handles: [..., ['field', {...}, <id>], ...] nested anywhere.
+        """
+        changed = False
+
+        if isinstance(obj, list):
+            # Check if this is a field reference: ['field', <opts>, <int_id>]
+            if (
+                len(obj) >= 3
+                and obj[0] == "field"
+                and isinstance(obj[-1], int)
+                and obj[-1] in field_id_map
+            ):
+                obj[-1] = field_id_map[obj[-1]]
+                changed = True
+
+            # Also check for integer field IDs in opts dict (e.g., join conditions)
+            for i, item in enumerate(obj):
+                if isinstance(item, (list, dict)):
+                    if self._remap_field_ids(item, field_id_map):
+                        changed = True
+                # Direct integer field refs in some contexts (e.g., old format)
+                elif isinstance(item, int) and i > 0 and obj[0] == "field" and item in field_id_map:
+                    obj[i] = field_id_map[item]
+                    changed = True
+
+        elif isinstance(obj, dict):
+            for key, value in obj.items():
+                if isinstance(value, (list, dict)):
+                    if self._remap_field_ids(value, field_id_map):
+                        changed = True
+
+        return changed
+
+    def _remap_native_query(self, dataset_query, schema_name_map):
+        # type: (dict, Dict[str, str]) -> bool
+        """Replace schema names in native SQL queries. Returns True if changed."""
+        native = dataset_query.get("native", {})
+        sql = native.get("query", "")
+
+        if not sql:
+            return False
+
+        new_sql = sql
+        for old_schema, new_schema in schema_name_map.items():
+            # Replace "old_schema". and old_schema. patterns
+            new_sql = new_sql.replace(
+                '"{}"'.format(old_schema), '"{}"'.format(new_schema)
+            )
+            new_sql = new_sql.replace(
+                "{}.".format(old_schema), "{}.".format(new_schema)
+            )
+
+        if new_sql != sql:
+            native["query"] = new_sql
+            return True
+
+        return False

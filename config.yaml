@@ -5,34 +5,45 @@ github:
   repo: "ignacio-mb/dbt-shop-analytics"       # GitHub repo (org/repo format)
   branch: "main"                        # Branch to read dbt models from
   # token: "ghp_..."                    # Or set GITHUB_TOKEN env var
-  subdirectory: ""                      # For monorepos: path to dbt project root
+  subdirectory: "dbt_project"                      # For monorepos: path to dbt project root
 
 metabase:
   url: "http://localhost:3000"   # Metabase instance URL
-  api_key: "mb_KZeRmBYszEmsD1fVvwzUgsBu7IehVdYQNsvPrhIYbfY="                   # Or set METABASE_API_KEY env var
+  api_key: "mb_ITp7B0k6Q9P90/YoO203AIwOdLs8ukJ5BpYVOpd1BI4="                   # Or set METABASE_API_KEY env var
   username: "admin@example.com"       # Or set METABASE_USERNAME env var
   password: "Metabase123"                     # Or set METABASE_PASSWORD env var
   database_id: 2                     # Target database ID in Metabase
-  default_schema: "analytics"           # Default schema for transform output tables
+  default_schema: "transforms_staging"           # Default schema for transform output tables
 
 remote_sync:
   enabled: true                        # Set true to push transforms to git after migration
   github_repo: "ignacio-mb/local-metabase-remote-sync"
   branch: "main"
 
+database:
+  host: "localhost"
+  port: 5433
+  name: "analytics"
+  user: "analytics_user"
+  password: "analytics_pass"
+
+remap_schema_map:
+  dbt_models_staging: transforms_staging
+  dbt_models_marts: transforms_marts
+
 # ──────────────────────────────────────────────
 # Schema mappings
 # Map dbt folder paths → Metabase target schemas
 # ──────────────────────────────────────────────
 schema_mappings:
+  - dbt_folder_pattern: "staging"
+    metabase_schema: "transforms_staging"
   - dbt_folder_pattern: "staging/*"
-    metabase_schema: "staging"
-  - dbt_folder_pattern: "intermediate/*"
-    metabase_schema: "intermediate"
+    metabase_schema: "transforms_staging"
+  - dbt_folder_pattern: "marts"
+    metabase_schema: "transforms_marts"
   - dbt_folder_pattern: "marts/*"
-    metabase_schema: "marts"
-  - dbt_folder_pattern: "marts/finance"
-    metabase_schema: "marts_finance"
+    metabase_schema: "transforms_marts"
 
 # ──────────────────────────────────────────────
 # Tag mappings

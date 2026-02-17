@@ -264,8 +264,8 @@ class MetabaseClient:
     def trigger_remote_sync(self):
         # type: () -> None
         try:
-            self._post("serialization/export")
-            logger.info("Triggered remote sync (serialization export)")
+            self._post("ee/remote-sync/export")
+            logger.info("Triggered remote sync (export)")
         except MetabaseApiError as e:
             if e.status_code == 404:
                 logger.warning("Remote sync not available (may not be enabled)")
@@ -291,4 +291,57 @@ class MetabaseClient:
             elapsed += poll_interval
         raise TimeoutError(
             "Transform run {} did not complete within {}s".format(run_id, timeout)
+        )
+
+    # Tables API
+
+    def get_database_metadata(self, database_id):
+        # type: (int) -> dict
+        return self._get("database/{}".format(database_id), params={"include": "tables"})
+
+    def list_tables(self, database_id):
+        # type: (int) -> List[dict]
+        """Get all tables for a database, including schema info."""
+        meta = self.get_database_metadata(database_id)
+        return meta.get("tables", [])
+
+    def get_table(self, table_id):
+        # type: (int) -> dict
+        return self._get("table/{}".format(table_id))
+
+    def get_table_fields(self, table_id):
+        # type: (int) -> List[dict]
+        """Get fields/columns for a table."""
+        meta = self._get("table/{}/query_metadata".format(table_id))
+        return meta.get("fields", [])
+
+    # Cards API
+
+    def list_cards(self):
+        # type: () -> List[dict]
+        return self._get("card")
+
+    def get_card(self, card_id):
+        # type: (int) -> dict
+        return self._get("card/{}".format(card_id))
+
+    def update_card(self, card_id, **kwargs):
+        # type: (int, **Any) -> dict
+        return self._put("card/{}".format(card_id), json=kwargs)
+
+    # Dashboards API
+
+    def list_dashboards(self):
+        # type: () -> List[dict]
+        return self._get("dashboard")
+
+    def get_dashboard(self, dashboard_id):
+        # type: (int) -> dict
+        return self._get("dashboard/{}".format(dashboard_id))
+
+    def update_dashboard_card(self, dashboard_id, cards_payload):
+        # type: (int, List[dict]) -> Any
+        return self._put(
+            "dashboard/{}".format(dashboard_id),
+            json={"dashcards": cards_payload},
         )

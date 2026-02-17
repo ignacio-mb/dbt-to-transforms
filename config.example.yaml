@@ -5,7 +5,7 @@ github:
   repo: "your-org/your-dbt-repo"       # GitHub repo (org/repo format)
   branch: "main"                        # Branch to read dbt models from
   # token: "ghp_..."                    # Or set GITHUB_TOKEN env var
-  subdirectory: ""                      # For monorepos: path to dbt project root
+  subdirectory: "dbt_project"                      # For monorepos: path to dbt project root
 
 metabase:
   url: "https://metabase.example.com"   # Metabase instance URL

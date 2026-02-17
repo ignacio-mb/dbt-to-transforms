@@ -90,6 +90,7 @@ class MigrationConfig:
     include_models: List[str] = field(default_factory=list)
     exclude_models: List[str] = field(default_factory=list)
     on_conflict: str = "skip"
+    remap_schema_map: Dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_yaml(cls, path):
@@ -121,4 +122,5 @@ class MigrationConfig:
             include_models=raw.get("include_models", []),
             exclude_models=raw.get("exclude_models", []),
             on_conflict=raw.get("on_conflict", "skip"),
+            remap_schema_map=raw.get("remap_schema_map", {}),
         )
