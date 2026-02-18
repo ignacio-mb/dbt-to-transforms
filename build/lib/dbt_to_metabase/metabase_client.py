@@ -105,19 +105,37 @@ class MetabaseClient:
     def create_transform(
         self, name, query, database_id, schema_name, table_name,
         description="", folder_id=None, transform_type="query",
+        is_incremental=False, checkpoint_column=None,
     ):
-        # type: (str, str, int, str, str, str, Optional[int], str) -> dict
+        # type: (str, str, int, str, str, str, Optional[int], str, bool, Optional[str]) -> dict
+        #
+        # Metabase API schema (from 400 response):
+        #   source.type          -> must always equal "query" (never "incremental-query")
+        #   source-incremental-strategy (optional, inside source):
+        #     type               -> must equal "checkpoint"
+        #     checkpoint-filter  -> string (the column name used as the incremental cursor)
+        #
+        source = {
+            "type": "query",          # always "query" regardless of incremental flag
+            "query": {
+                "database": database_id,
+                "type": "native",
+                "native": {"query": query},
+            },
+        }  # type: Dict[str, Any]
+
+        if is_incremental and checkpoint_column:
+            # Embed the strategy inside the source object, not at payload root.
+            # Key is "source-incremental-strategy", inner type is "checkpoint".
+            source["source-incremental-strategy"] = {
+                "type": "checkpoint",
+                "checkpoint-filter": checkpoint_column,
+            }
+
         payload = {
             "name": name,
             "database_id": database_id,
-            "source": {
-                "type": transform_type,
-                "query": {
-                    "database": database_id,
-                    "type": "native",
-                    "native": {"query": query},
-                },
-            },
+            "source": source,
             "target": {
                 "type": "table",
                 "schema": schema_name,
@@ -131,8 +149,9 @@ class MetabaseClient:
 
         result = self._post("transform", json=payload)
         logger.info(
-            "Created transform '%s' (id=%s) -> %s.%s",
+            "Created transform '%s' (id=%s) -> %s.%s (incremental=%s, checkpoint=%s)",
             name, result.get("id"), schema_name, table_name,
+            is_incremental, checkpoint_column,
         )
         return result
 
@@ -148,14 +167,22 @@ class MetabaseClient:
     def set_transform_incremental(self, transform_id, checkpoint_column):
         # type: (int, str) -> dict
         return self._put(
-            "transform/{}/settings".format(transform_id),
-            json={"incremental": True, "checkpoint_column": checkpoint_column},
+            "ee/transform/{}".format(transform_id),
+            json={
+                "source-incremental-strategy": {
+                    "column": checkpoint_column,
+                },
+            },
         )
 
-    def run_transform(self, transform_id):
-        # type: (int) -> dict
-        result = self._post("transform/{}/run".format(transform_id))
-        logger.info("Started run for transform id=%d", transform_id)
+    def run_transform(self, transform_id, full_refresh=False):
+        # type: (int, bool) -> dict
+        payload = {"full-refresh": True} if full_refresh else None
+        result = self._post("transform/{}/run".format(transform_id), json=payload)
+        logger.info(
+            "Started run for transform id=%d (full_refresh=%s)",
+            transform_id, full_refresh,
+        )
         return result
 
     def get_transform_runs(self, transform_id):
@@ -264,8 +291,8 @@ class MetabaseClient:
     def trigger_remote_sync(self):
         # type: () -> None
         try:
-            self._post("serialization/export")
-            logger.info("Triggered remote sync (serialization export)")
+            self._post("ee/remote-sync/export")
+            logger.info("Triggered remote sync (export)")
         except MetabaseApiError as e:
             if e.status_code == 404:
                 logger.warning("Remote sync not available (may not be enabled)")
@@ -291,4 +318,88 @@ class MetabaseClient:
             elapsed += poll_interval
         raise TimeoutError(
             "Transform run {} did not complete within {}s".format(run_id, timeout)
+        )
+
+    # Tables API
+
+    def get_database_metadata(self, database_id):
+        # type: (int) -> dict
+        return self._get("database/{}".format(database_id), params={"include": "tables"})
+
+    def list_tables(self, database_id):
+        # type: (int) -> List[dict]
+        """Get all tables for a database, including schema info."""
+        meta = self.get_database_metadata(database_id)
+        return meta.get("tables", [])
+
+    def get_table(self, table_id):
+        # type: (int) -> dict
+        return self._get("table/{}".format(table_id))
+
+    def activate_table(self, schema_name, table_name, database_id):
+        # type: (str, str, int) -> bool
+        """Find a Metabase table entry by schema+name and set it active.
+
+        When a transform is deleted (or its first run fails), Metabase keeps the
+        table in its metadata catalog but marks it active=false.  Any subsequent
+        run against that table returns 500 "is inactive" until it is reactivated.
+
+        Returns True if a matching table was found and activated, False if not found.
+        """
+        tables = self.list_tables(database_id)
+        for t in tables:
+            if (
+                t.get("schema", "").lower() == schema_name.lower()
+                and t.get("name", "").lower() == table_name.lower()
+            ):
+                table_id = t["id"]
+                if not t.get("active", True):
+                    self._put("table/{}".format(table_id), json={"active": True})
+                    logger.info(
+                        "Reactivated stale table entry %s.%s (id=%d)",
+                        schema_name, table_name, table_id,
+                    )
+                else:
+                    logger.debug(
+                        "Table %s.%s (id=%d) is already active",
+                        schema_name, table_name, table_id,
+                    )
+                return True
+        return False
+
+    def get_table_fields(self, table_id):
+        # type: (int) -> List[dict]
+        """Get fields/columns for a table."""
+        meta = self._get("table/{}/query_metadata".format(table_id))
+        return meta.get("fields", [])
+
+    # Cards API
+
+    def list_cards(self):
+        # type: () -> List[dict]
+        return self._get("card")
+
+    def get_card(self, card_id):
+        # type: (int) -> dict
+        return self._get("card/{}".format(card_id))
+
+    def update_card(self, card_id, **kwargs):
+        # type: (int, **Any) -> dict
+        return self._put("card/{}".format(card_id), json=kwargs)
+
+    # Dashboards API
+
+    def list_dashboards(self):
+        # type: () -> List[dict]
+        return self._get("dashboard")
+
+    def get_dashboard(self, dashboard_id):
+        # type: (int) -> dict
+        return self._get("dashboard/{}".format(dashboard_id))
+
+    def update_dashboard_card(self, dashboard_id, cards_payload):
+        # type: (int, List[dict]) -> Any
+        return self._put(
+            "dashboard/{}".format(dashboard_id),
+            json={"dashcards": cards_payload},
         )

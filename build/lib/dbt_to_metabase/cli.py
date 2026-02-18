@@ -80,6 +80,48 @@ def cmd_plan(args):
     return 0
 
 
+def cmd_remap(args):
+    # type: (argparse.Namespace) -> int
+    config = MigrationConfig.from_yaml(args.config)
+
+    migrator = Migrator(config)
+    try:
+        results = migrator.run_remap()
+    except MigrationError as e:
+        logging.error("Remap failed: %s", e)
+        return 1
+
+    print("\n" + "=" * 50)
+    print("REMAP RESULTS")
+    print("=" * 50)
+    print("  Table mappings:      {}".format(len(results["table_mappings"])))
+    print("  Cards updated:       {}".format(len(results["cards_updated"])))
+    print("  Cards skipped:       {}".format(len(results["cards_skipped"])))
+    print("  Warnings:            {}".format(len(results["warnings"])))
+
+    if results["table_mappings"]:
+        print("\n  Table ID mappings:")
+        for m in results["table_mappings"]:
+            print("    {}.{} (id={}) -> {}.{} (id={})".format(
+                m["old_schema"], m["table_name"], m["old_id"],
+                m["new_schema"], m["table_name"], m["new_id"],
+            ))
+
+    if results["cards_updated"]:
+        print("\n  Cards updated:")
+        for c in results["cards_updated"]:
+            print("    {} (id={}, type={})".format(c["name"], c["id"], c["type"]))
+
+    if results["warnings"]:
+        print("\n" + "=" * 50)
+        print("WARNINGS")
+        print("=" * 50)
+        for w in results["warnings"]:
+            print("  !  {}".format(w))
+
+    return 0
+
+
 def cmd_validate(args):
     # type: (argparse.Namespace) -> int
     try:
@@ -155,6 +197,13 @@ def main():
     p_validate = subparsers.add_parser("validate", help="Validate config and project")
     p_validate.add_argument("--config", "-c", required=True, help="Path to config YAML")
     p_validate.set_defaults(func=cmd_validate)
+
+    p_remap = subparsers.add_parser(
+        "remap",
+        help="Remap Metabase cards from dbt tables to transform tables",
+    )
+    p_remap.add_argument("--config", "-c", required=True, help="Path to config YAML")
+    p_remap.set_defaults(func=cmd_remap)
 
     args = parser.parse_args()
     if not args.command:
