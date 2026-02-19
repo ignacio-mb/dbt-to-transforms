@@ -22,8 +22,13 @@ remote_sync:
 
 # ──────────────────────────────────────────────
 # Schema mappings
-# Map dbt folder paths → Metabase target schemas
+# Map dbt folder paths → Metabase target schemas.
+# The transform_schema_prefix (default: "transforms_") is automatically
+# prepended, so "staging" becomes "transforms_staging" in Metabase.
+# This keeps transforms separate from the original dbt-produced tables.
 # ──────────────────────────────────────────────
+transform_schema_prefix: "transforms_"
+
 schema_mappings:
   - dbt_folder_pattern: "staging/*"
     metabase_schema: "staging"

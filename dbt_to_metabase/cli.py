@@ -28,7 +28,7 @@ def cmd_migrate(args):
     if args.dry_run:
         config.dry_run = True
 
-    migrator = Migrator(config)
+    migrator = Migrator(config, enable_validation=args.validate)
     try:
         plan = migrator.run()
     except MigrationError as e:
@@ -53,6 +53,19 @@ def cmd_migrate(args):
         print("=" * 50)
         for w in plan.warnings:
             print("  !  {}".format(w))
+
+    # Print validation summary if enabled
+    if args.validate and migrator.validation_report:
+        report = migrator.validation_report
+        if not report.all_passed:
+            print("\n  ✗ DATA VALIDATION FAILED: {} of {} tables differ".format(
+                report.tables_failed, report.total_tables
+            ))
+            return 2  # Distinct exit code for validation failure
+        else:
+            print("\n  ✓ DATA VALIDATION PASSED: all {} tables match".format(
+                report.tables_passed
+            ))
 
     return 0
 
@@ -80,8 +93,68 @@ def cmd_plan(args):
     return 0
 
 
+def cmd_remap(args):
+    # type: (argparse.Namespace) -> int
+    config = MigrationConfig.from_yaml(args.config)
+
+    migrator = Migrator(config)
+    try:
+        results = migrator.run_remap()
+    except MigrationError as e:
+        logging.error("Remap failed: %s", e)
+        return 1
+
+    print("\n" + "=" * 50)
+    print("REMAP RESULTS")
+    print("=" * 50)
+    print("  Table mappings:      {}".format(len(results["table_mappings"])))
+    print("  Cards updated:       {}".format(len(results["cards_updated"])))
+    print("  Cards skipped:       {}".format(len(results["cards_skipped"])))
+    print("  Warnings:            {}".format(len(results["warnings"])))
+
+    if results["table_mappings"]:
+        print("\n  Table ID mappings:")
+        for m in results["table_mappings"]:
+            print("    {}.{} (id={}) -> {}.{} (id={})".format(
+                m["old_schema"], m["table_name"], m["old_id"],
+                m["new_schema"], m["table_name"], m["new_id"],
+            ))
+
+    if results["cards_updated"]:
+        print("\n  Cards updated:")
+        for c in results["cards_updated"]:
+            print("    {} (id={}, type={})".format(c["name"], c["id"], c["type"]))
+
+    if results["warnings"]:
+        print("\n" + "=" * 50)
+        print("WARNINGS")
+        print("=" * 50)
+        for w in results["warnings"]:
+            print("  !  {}".format(w))
+
+    return 0
+
+
 def cmd_validate(args):
     # type: (argparse.Namespace) -> int
+    """Standalone validation: check that transform tables match dbt expectations."""
+    config = MigrationConfig.from_yaml(args.config)
+
+    migrator = Migrator(config)
+    try:
+        report = migrator.run_validate_only()
+    except MigrationError as e:
+        logging.error("Validation failed: %s", e)
+        return 1
+
+    if not report.all_passed:
+        return 2  # Distinct exit code for validation failure
+    return 0
+
+
+def cmd_check(args):
+    # type: (argparse.Namespace) -> int
+    """Validate config and connectivity (previously 'validate', now 'check')."""
     try:
         config = MigrationConfig.from_yaml(args.config)
         print("OK Config loaded from {}".format(args.config))
@@ -121,7 +194,7 @@ def cmd_validate(args):
         print("FAIL Metabase connection error: {}".format(e))
         return 1
 
-    print("\nOK All validations passed. Ready to migrate.")
+    print("\nOK All checks passed. Ready to migrate.")
     return 0
 
 
@@ -140,21 +213,44 @@ def main():
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 
+    # migrate
     p_migrate = subparsers.add_parser("migrate", help="Run the full migration")
     p_migrate.add_argument("--config", "-c", required=True, help="Path to config YAML")
     p_migrate.add_argument("--dry-run", action="store_true", help="Plan only")
     p_migrate.add_argument("--output", "-o", help="Export plan to JSON file")
+    p_migrate.add_argument(
+        "--validate", action="store_true",
+        help="Run data validation after transforms complete (compares output against dbt tables)",
+    )
     p_migrate.set_defaults(func=cmd_migrate)
 
+    # plan
     p_plan = subparsers.add_parser("plan", help="Generate plan without executing")
     p_plan.add_argument("--config", "-c", required=True, help="Path to config YAML")
     p_plan.add_argument("--output", "-o", help="Output JSON file")
     p_plan.add_argument("--stdout", action="store_true", help="Print plan to stdout")
     p_plan.set_defaults(func=cmd_plan)
 
-    p_validate = subparsers.add_parser("validate", help="Validate config and project")
+    # validate (data validation)
+    p_validate = subparsers.add_parser(
+        "validate",
+        help="Validate that transform output tables match dbt expectations",
+    )
     p_validate.add_argument("--config", "-c", required=True, help="Path to config YAML")
     p_validate.set_defaults(func=cmd_validate)
+
+    # check (config/connectivity check — was previously 'validate')
+    p_check = subparsers.add_parser("check", help="Validate config and connectivity")
+    p_check.add_argument("--config", "-c", required=True, help="Path to config YAML")
+    p_check.set_defaults(func=cmd_check)
+
+    # remap
+    p_remap = subparsers.add_parser(
+        "remap",
+        help="Remap Metabase cards from dbt tables to transform tables",
+    )
+    p_remap.add_argument("--config", "-c", required=True, help="Path to config YAML")
+    p_remap.set_defaults(func=cmd_remap)
 
     args = parser.parse_args()
     if not args.command:

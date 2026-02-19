@@ -1,9 +1,15 @@
 """
 Rewrite dbt Jinja-templated SQL into plain SQL compatible with Metabase transforms.
+
+In Metabase Transforms every model becomes a physical table, regardless of its
+dbt materialization (view, table, incremental, **or ephemeral**).  Therefore
+ref() calls to ephemeral models are resolved to ``schema.table_name`` just like
+any other model -- there is no CTE inlining.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 import re
 from typing import Dict, List, Optional, Tuple
@@ -22,19 +28,112 @@ from .models import DbtModel, DbtProject
 
 logger = logging.getLogger(__name__)
 
+# Maps dbt datepart strings to PostgreSQL interval literals
+_DATEPART_TO_INTERVAL = {
+    "day": "1 day",
+    "week": "1 week",
+    "month": "1 month",
+    "quarter": "3 months",
+    "year": "1 year",
+    "hour": "1 hour",
+    "minute": "1 minute",
+    "second": "1 second",
+}
+
+
+def _split_macro_args(args_str):
+    # type: (str) -> List[str]
+    """Split macro args on top-level commas, respecting nested parens and quotes."""
+    args = []
+    depth = 0
+    current = []
+    in_single = False
+    in_double = False
+    for char in args_str:
+        if char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            elif char == "," and depth == 0:
+                args.append("".join(current).strip())
+                current = []
+                continue
+        current.append(char)
+    if current:
+        args.append("".join(current).strip())
+    return [a for a in args if a]
+
+
+def _strip_jinja_string(s):
+    # type: (str) -> str
+    """Strip outer Jinja-string quotes from a macro arg."""
+    s = s.strip()
+    if (s.startswith("'") and s.endswith("'")) or (
+        s.startswith('"') and s.endswith('"')
+    ):
+        return s[1:-1]
+    return s
+
+
+def _eval_jinja_string_concat(s, project_vars=None):
+    # type: (str, Optional[Dict]) -> str
+    """Evaluate Jinja ~ string-concatenation and resolve bare var() calls."""
+    if project_vars:
+        bare_var_pat = re.compile(
+            r"""var\(\s*['"]([^'"]+)['"]\s*(?:,\s*(?:['"]([^'"]*)['"]|([^\)]*)))?\s*\)""",
+            re.DOTALL,
+        )
+        def var_replacer(mv):
+            var_name = mv.group(1)
+            default  = mv.group(2) if mv.group(2) is not None else mv.group(3)
+            val = project_vars.get(var_name, default)
+            if val is None:
+                return mv.group(0)
+            return "'{}'".format(str(val))
+        s = bare_var_pat.sub(var_replacer, s)
+
+    tilde_pat = re.compile(
+        r"""(?:'([^']*)'|"([^"]*)")\s*~\s*(?:'([^']*)'|"([^"]*)")""",
+        re.DOTALL,
+    )
+    for _ in range(20):
+        m = tilde_pat.search(s)
+        if not m:
+            break
+        left  = m.group(1) if m.group(1) is not None else m.group(2)
+        right = m.group(3) if m.group(3) is not None else m.group(4)
+        combined = '"' + left + right + '"'
+        s = s[:m.start()] + combined + s[m.end():]
+    return s
+
 
 class SqlRewriter:
-    def __init__(self, project, default_schema="analytics", schema_overrides=None):
-        # type: (DbtProject, str, Optional[Dict[str, str]]) -> None
+    def __init__(self, project, default_schema="analytics", schema_overrides=None,
+                 transform_schema_prefix=""):
+        # type: (DbtProject, str, Optional[Dict[str, str]], str) -> None
         self.project = project
         self.default_schema = default_schema
         self.schema_overrides = schema_overrides or {}
+        self.transform_schema_prefix = transform_schema_prefix
         self._model_lookup = {
             m.name: m for m in project.models.values()
         }  # type: Dict[str, DbtModel]
 
     def rewrite(self, model):
         # type: (DbtModel) -> Tuple[str, List[str]]
+        """Rewrite a dbt model's raw SQL into plain SQL for Metabase transforms.
+
+        ALL ref() calls -- including those to ephemeral models -- are resolved to
+        ``schema.table_name``.  Metabase transforms always create tables, so
+        every model will have a physical table to point at.
+        """
+        self._last_checkpoint_column = None  # type: Optional[str]
+
         sql = model.raw_sql
         warnings = []  # type: List[str]
 
@@ -44,7 +143,7 @@ class SqlRewriter:
         # 2. Strip {{ config(...) }}
         sql = CONFIG_PATTERN.sub("", sql)
 
-        # 3. Replace {{ ref('model_name') }}
+        # 3. Replace {{ ref('model_name') }} -- all models resolve to schema.table
         sql = self._replace_refs(sql, model, warnings)
 
         # 4. Replace {{ source('source_name', 'table_name') }}
@@ -53,13 +152,13 @@ class SqlRewriter:
         # 5. Replace {{ var('name') }}
         sql = self._replace_vars(sql, warnings)
 
-        # 6. Handle incremental blocks (uses a placeholder to survive cleanup)
-        _CHECKPOINT_PLACEHOLDER = "__METABASE_CHECKPOINT__"
+        # 6. Handle incremental blocks
         sql = self._handle_incremental(sql, model, warnings)
-        # Temporarily protect Metabase checkpoint syntax from Jinja cleanup
-        sql = sql.replace("{{checkpoint}}", _CHECKPOINT_PLACEHOLDER)
 
-        # 7. Strip any remaining Jinja blocks
+        # 6.5  Macro translation
+        sql = self._translate_macros(sql, model, warnings)
+
+        # 7. Strip remaining Jinja blocks  {% ... %}
         remaining_blocks = JINJA_BLOCK_PATTERN.findall(sql)
         if remaining_blocks:
             for block in remaining_blocks:
@@ -68,26 +167,154 @@ class SqlRewriter:
                 )
             sql = JINJA_BLOCK_PATTERN.sub("", sql)
 
+        # 8. Replace remaining Jinja expressions  {{ ... }}  with NULL
         remaining_exprs = JINJA_EXPR_PATTERN.findall(sql)
         if remaining_exprs:
             for expr in remaining_exprs:
                 warnings.append(
-                    "Unsupported Jinja expression stripped: {}...".format(expr[:80])
+                    "Unsupported Jinja expression replaced with NULL: {}...".format(
+                        expr[:80]
+                    )
                 )
-            sql = JINJA_EXPR_PATTERN.sub("", sql)
+            sql = JINJA_EXPR_PATTERN.sub("NULL", sql)
 
-        # 8. Clean up whitespace
+        # 8.5  Fix Python/BigQuery-style JSONB bracket access.
+        sql = self._fix_json_bracket_access(sql)
+
+        # 9. Check if NULL replacement produced structurally broken SQL.
+        if self._is_structurally_broken(sql):
+            schema = self._resolve_schema(model)
+            passthrough = "SELECT * FROM {}.{}".format(schema, model.name)
+            warnings.append(
+                "Model relies on untranslatable macros. "
+                "Using passthrough query: {}".format(passthrough)
+            )
+            sql = passthrough
+
+        # 10. Clean up whitespace
         sql = self._clean_whitespace(sql)
-
-        # 9. Restore Metabase checkpoint syntax
-        sql = sql.replace(_CHECKPOINT_PLACEHOLDER, "{{checkpoint}}")
 
         return sql, warnings
 
+    # ------------------------------------------------------------------
+    # Macro translation
+    # ------------------------------------------------------------------
+
+    def _translate_macros(self, sql, model, warnings):
+        # type: (str, DbtModel, List[str]) -> str
+        sql = self._translate_days_between(sql, warnings)
+        sql = self._translate_safe_divide(sql, warnings)
+        sql = self._translate_date_spine(sql, warnings)
+        return sql
+
+    def _translate_days_between(self, sql, warnings):
+        # type: (str, List[str]) -> str
+        pattern = re.compile(
+            r"\{\{\s*days_between\(\s*(.*?)\s*\)\s*\}\}", re.DOTALL
+        )
+        def replacer(m):
+            args = _split_macro_args(m.group(1))
+            if len(args) != 2:
+                warnings.append(
+                    "days_between: expected 2 args, got {}; replaced with NULL".format(len(args))
+                )
+                return "NULL"
+            start = _strip_jinja_string(args[0])
+            end = _strip_jinja_string(args[1])
+            return "({end}::date - {start}::date)".format(start=start, end=end)
+        return pattern.sub(replacer, sql)
+
+    def _translate_safe_divide(self, sql, warnings):
+        # type: (str, List[str]) -> str
+        pattern = re.compile(
+            r"\{\{\s*safe_divide\(\s*(.*?)\s*\)\s*\}\}", re.DOTALL
+        )
+        def replacer(m):
+            args = _split_macro_args(m.group(1))
+            if len(args) != 2:
+                warnings.append(
+                    "safe_divide: expected 2 args, got {}; replaced with NULL".format(len(args))
+                )
+                return "NULL"
+            num = _strip_jinja_string(args[0])
+            den = _strip_jinja_string(args[1])
+            return "({num})::numeric / NULLIF({den}, 0)".format(num=num, den=den)
+        return pattern.sub(replacer, sql)
+
+    def _translate_date_spine(self, sql, warnings):
+        # type: (str, List[str]) -> str
+        pattern = re.compile(
+            r"\{\{\s*dbt_utils\.date_spine\(\s*(.*?)\s*\)\s*\}\}", re.DOTALL
+        )
+        def replacer(m):
+            raw = _eval_jinja_string_concat(m.group(1), self.project.vars)
+            kw_pat = re.compile(r'(\w+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\')', re.DOTALL)
+            kwargs = {}
+            for kw_m in kw_pat.finditer(raw):
+                key = kw_m.group(1)
+                val = kw_m.group(2) if kw_m.group(2) is not None else kw_m.group(3)
+                kwargs[key] = val.strip()
+            datepart = kwargs.get("datepart", "day").lower()
+            start_date = kwargs.get("start_date", "current_date - interval '1 year'")
+            end_date = kwargs.get("end_date", "current_date")
+            interval = _DATEPART_TO_INTERVAL.get(datepart, "1 {}".format(datepart))
+            return (
+                "SELECT generate_series(\n"
+                "        ({start})::timestamp,\n"
+                "        ({end})::timestamp,\n"
+                "        '{interval}'::interval\n"
+                "    )::date AS date_day".format(
+                    start=start_date, end=end_date, interval=interval
+                )
+            )
+        return pattern.sub(replacer, sql)
+
+    # ------------------------------------------------------------------
+    # JSONB bracket access fix
+    # ------------------------------------------------------------------
+
+    def _fix_json_bracket_access(self, sql):
+        # type: (str) -> str
+        sq = re.compile(r"(\b\w+(?:\.\w+)*)\['([^']+)'\]")
+        dq = re.compile(r'(\b\w+(?:\.\w+)*)\["([^"]+)"\]')
+        original = sql
+        sql = sq.sub(lambda mo: mo.group(1) + "->>" + "'" + mo.group(2) + "'", sql)
+        sql = dq.sub(lambda mo: mo.group(1) + "->>" + "'" + mo.group(2) + "'", sql)
+        if sql != original:
+            logger.info("Fixed Python-style JSON bracket access -> PostgreSQL ->> operator")
+        return sql
+
+    # ------------------------------------------------------------------
+    # Structural-break detector
+    # ------------------------------------------------------------------
+
+    def _is_structurally_broken(self, sql):
+        # type: (str) -> bool
+        if re.search(r"\bas\b\s*\(\s*NULL\s*\)", sql, re.IGNORECASE | re.DOTALL):
+            logger.warning(
+                "_is_structurally_broken: NULL CTE body found. "
+                "A macro was not translated. Add a handler in _translate_macros()."
+            )
+            return True
+        stripped = sql.strip().rstrip(";").strip()
+        if stripped.upper() == "NULL":
+            return True
+        if re.search(r"\bFROM\s+NULL\b", sql, re.IGNORECASE):
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Ref / source / var / incremental helpers
+    # ------------------------------------------------------------------
+
     def _replace_refs(self, sql, model, warnings):
         # type: (str, DbtModel, List[str]) -> str
+        """Replace {{ ref('model_name') }} with schema.table_name.
+
+        ALL models -- including ephemeral -- are resolved to schema.table_name
+        because in Metabase Transforms every model becomes a physical table.
+        """
         def replacer(match):
-            # type: (re.Match) -> str
             ref_name = match.group(1)
             target = self._model_lookup.get(ref_name)
             if target:
@@ -107,7 +334,6 @@ class SqlRewriter:
     def _replace_sources(self, sql, model, warnings):
         # type: (str, DbtModel, List[str]) -> str
         def replacer(match):
-            # type: (re.Match) -> str
             source_name = match.group(1)
             table_name = match.group(2)
             source = self.project.sources.get(source_name)
@@ -132,13 +358,14 @@ class SqlRewriter:
     def _replace_vars(self, sql, warnings):
         # type: (str, List[str]) -> str
         def replacer(match):
-            # type: (re.Match) -> str
             var_name = match.group(1)
             default = match.group(2) if match.group(2) else None
             val = self.project.vars.get(var_name, default)
             if val is None:
                 warnings.append(
-                    "var('{}') has no value and no default; replaced with NULL".format(var_name)
+                    "var('{}') has no value and no default; replaced with NULL".format(
+                        var_name
+                    )
                 )
                 return "NULL"
             if isinstance(val, str):
@@ -149,6 +376,8 @@ class SqlRewriter:
 
     def _handle_incremental(self, sql, model, warnings):
         # type: (str, DbtModel, List[str]) -> str
+        self._last_checkpoint_column = None
+
         if not model.is_incremental:
             sql = INCREMENTAL_BLOCK_PATTERN.sub("", sql)
             return sql
@@ -161,37 +390,29 @@ class SqlRewriter:
             return sql
 
         inc_block = match.group(1).strip()
-
         checkpoint_pattern = re.compile(
-            r"(?:WHERE|AND)\s+(\w+)\s*([>>=]+)\s*\("
-            r"SELECT\s+(?:MAX|max)\((\w+)\)\s+FROM\s+\{\{\s*this\s*\}\}"
+            r"(?:WHERE|AND)\s+([\w.]+)\s*[>>=]+\s*\("
+            r"SELECT\s+(?:MAX|max)\(([\w.]+)\)\s+FROM\s+\{\{\s*this\s*\}\}"
             r"\)",
             re.IGNORECASE,
         )
         cp_match = checkpoint_pattern.search(inc_block)
 
         if cp_match:
-            col = cp_match.group(1)
-            cast_suffix = ""
-            if any(
-                hint in col.lower()
-                for hint in ["_at", "date", "time", "created", "updated", "timestamp"]
-            ):
-                cast_suffix = "::timestamp"
-
-            metabase_clause = "[[WHERE {} > {{{{checkpoint}}}}{}]]".format(col, cast_suffix)
-            sql = INCREMENTAL_BLOCK_PATTERN.sub(metabase_clause, sql)
+            max_col = cp_match.group(2)
+            col = max_col.split(".")[-1]
+            self._last_checkpoint_column = col
+            warnings.append(
+                "Incremental checkpoint column '{}' detected. "
+                "Will configure via Metabase API.".format(col)
+            )
         else:
             warnings.append(
-                "Could not auto-convert incremental block: {}... "
-                "Please manually add Metabase checkpoint syntax.".format(inc_block[:100])
+                "Could not detect checkpoint column from incremental block: {}... "
+                "Set it manually in Metabase.".format(inc_block[:100])
             )
-            sql = INCREMENTAL_BLOCK_PATTERN.sub(
-                "\n-- TODO: Convert to Metabase incremental syntax:\n"
-                "-- Original: {}\n"
-                "-- Metabase syntax: [[WHERE col > {{{{checkpoint}}}}]]\n".format(inc_block),
-                sql,
-            )
+
+        sql = INCREMENTAL_BLOCK_PATTERN.sub("", sql)
 
         this_pattern = re.compile(r"\{\{\s*this\s*\}\}")
         if this_pattern.search(sql):
@@ -202,10 +423,29 @@ class SqlRewriter:
 
     def _resolve_schema(self, model):
         # type: (DbtModel) -> str
-        if model.folder in self.schema_overrides:
-            return self.schema_overrides[model.folder]
+        """Resolve the target schema for a model.
+
+        Uses fnmatch so glob patterns like ``staging/*`` work correctly.
+        Schema overrides are already prefixed by the caller, so matches
+        return the full transforms_* schema.  Fallbacks also get the prefix
+        so refs never accidentally point at the original dbt tables.
+
+        Seeds are an exception: they are pre-existing raw tables that are NOT
+        recreated as transforms, so refs to seeds must point at their original
+        (unprefixed) schema.
+        """
+        # Seeds live in their original schema — no transform prefix.
+        if model.config.get("is_seed"):
+            return model.schema_name or self.default_schema.replace(
+                self.transform_schema_prefix, ""
+            )
+
+        for pattern, schema in self.schema_overrides.items():
+            if fnmatch.fnmatch(model.folder, pattern) or model.folder == pattern:
+                return schema
+        prefix = self.transform_schema_prefix
         if model.schema_name:
-            return model.schema_name
+            return "{}{}".format(prefix, model.schema_name)
         return self.default_schema
 
     def _clean_whitespace(self, sql):

@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Sensitive config (has API keys, passwords)
+config.yaml
+
+# dbt artifacts
+target/
+dbt_packages/
+logs/
+
+# Migration output
+plan.json
+
+# macOS
+.DS_Store
+__MACOSX/

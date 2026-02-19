@@ -3,6 +3,7 @@ pyproject.toml
 dbt_to_metabase/__init__.py
 dbt_to_metabase/cli.py
 dbt_to_metabase/config.py
+dbt_to_metabase/data_validator.py
 dbt_to_metabase/dbt_parser.py
 dbt_to_metabase/dependency_resolver.py
 dbt_to_metabase/metabase_client.py
@@ -16,3 +17,4 @@ dbt_to_metabase.egg-info/entry_points.txt
 dbt_to_metabase.egg-info/requires.txt
 dbt_to_metabase.egg-info/top_level.txt
 tests/test_core.py
+tests/test_data_validation.py

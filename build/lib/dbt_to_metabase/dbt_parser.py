@@ -134,11 +134,15 @@ class GitHubDbtParser:
         project = self._parse_project_yml()
         self._parse_schema_files(project)
         self._parse_model_files(project)
+        self._parse_seeds(project)
         self._resolve_dependencies(project)
 
+        seed_count = len([m for m in project.models.values() if m.config.get("is_seed")])
+        model_count = len(project.models) - seed_count
         logger.info(
-            "Parsed %d models and %d sources from dbt project '%s'",
-            len(project.models),
+            "Parsed %d models, %d seeds, and %d sources from dbt project '%s'",
+            model_count,
+            seed_count,
             len(project.sources),
             project.name,
         )
@@ -148,6 +152,7 @@ class GitHubDbtParser:
         # type: () -> DbtProject
         content = self._get_file_content("dbt_project.yml")
         raw = yaml.safe_load(content)  # type: dict
+        self._project_yml_raw = raw
 
         project = DbtProject(
             name=raw.get("name", "unknown"),
@@ -166,7 +171,9 @@ class GitHubDbtParser:
         models_cfg = raw.get("models", {})
         project_name = raw.get("name", "")
         if project_name in models_cfg:
-            return models_cfg[project_name].get("schema", "public")
+            proj = models_cfg[project_name]
+            # dbt_project.yml uses "+schema" (with +) or "schema" (without)
+            return proj.get("schema") or proj.get("+schema") or "public"
         return "public"
 
     def _parse_schema_files(self, project):
@@ -324,18 +331,106 @@ class GitHubDbtParser:
         if not configs:
             return default
 
+        # dbt_project.yml uses a "+" prefix convention for config keys
+        # (e.g. "+schema", "+materialized", "+tags").  Check both forms so
+        # that configs written either way are picked up correctly.
+        def _get_key(d, k, fallback):
+            # type: (dict, str, Any) -> Any
+            if k in d:
+                return d[k]
+            if ("+{}".format(k)) in d:
+                return d["+{}".format(k)]
+            return fallback
+
         parts = [p for p in folder.split("/") if p]
         current = configs
         for proj_key in current:
             if isinstance(current[proj_key], dict):
                 sub = current[proj_key]
-                val = sub.get(key, default)
+                val = _get_key(sub, key, default)
                 for part in parts:
                     if part in sub and isinstance(sub[part], dict):
                         sub = sub[part]
-                        val = sub.get(key, val)
+                        val = _get_key(sub, key, val)
                 return val
         return default
+
+    def _parse_seeds(self, project):
+        # type: (DbtProject) -> None
+        """Register seeds as pseudo-models so ref('seed_name') resolves."""
+        seed_paths = self._project_yml_raw.get("seed-paths", ["seeds"])
+        seed_schema = self._get_seed_schema(project)
+
+        for seed_path in seed_paths:
+            try:
+                csv_files = self._walk_directory(seed_path, extension=".csv")
+            except Exception as e:
+                logger.warning("Could not scan seed path '%s': %s", seed_path, e)
+                continue
+
+            for csv_file in csv_files:
+                name = PurePosixPath(csv_file["name"]).stem
+                unique_id = "seed.{}.{}".format(project.name, name)
+
+                # Don't overwrite if a model with the same name exists
+                if any(m.name == name for m in project.models.values()):
+                    logger.debug("Seed '%s' shadowed by existing model, skipping", name)
+                    continue
+
+                model = DbtModel(
+                    unique_id=unique_id,
+                    name=name,
+                    path=csv_file.get("path", ""),
+                    raw_sql="",
+                    materialization=DbtMaterialization.TABLE,
+                    schema_name=seed_schema,
+                    tags=[],
+                    description="dbt seed: {}".format(name),
+                    config={"is_seed": True},
+                    folder="",
+                )
+                project.models[unique_id] = model
+                logger.info("Registered seed '%s' -> %s.%s", name, seed_schema, name)
+
+    def _get_seed_schema(self, project):
+        # type: (DbtProject) -> str
+        """Resolve the schema where dbt seeds are written.
+
+        Priority order:
+          1. seeds.<project_name>.+schema  in dbt_project.yml
+          2. seeds.<project_name>.schema   (legacy key)
+          3. seeds.+schema / seeds.schema  (project-wide seeds default)
+          4. "seeds"                        (safe conventional default)
+
+        We do NOT fall back to project.target_schema: seeds live in a raw/
+        reference schema, never in the transform output schema, so doing so
+        would resolve ref('seed_name') to a table that doesn't exist there.
+        Add  seeds > <project> > +schema: <your_schema>  to dbt_project.yml
+        to configure the correct schema.
+        """
+        seeds_config = self._project_yml_raw.get("seeds", {})
+
+        # Check project-scoped seed config first
+        project_seeds = seeds_config.get(project.name)
+        if isinstance(project_seeds, dict):
+            schema = project_seeds.get("+schema") or project_seeds.get("schema")
+            if schema:
+                return schema
+
+        # Fall back to top-level seeds config (project-wide default)
+        if isinstance(seeds_config, dict):
+            schema = seeds_config.get("+schema") or seeds_config.get("schema")
+            if schema:
+                return schema
+
+        # Safe conventional default — log so the operator knows to configure it
+        logger.warning(
+            "No seed schema configured in dbt_project.yml for project '%s'. "
+            "Defaulting to 'seeds'. Add  seeds > %s > +schema: <schema>  "
+            "to dbt_project.yml to set the correct schema.",
+            project.name, project.name,
+        )
+        return "seeds"
 
     def _resolve_dependencies(self, project):
         # type: (DbtProject) -> None
