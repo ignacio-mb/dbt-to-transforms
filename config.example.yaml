@@ -22,8 +22,13 @@ remote_sync:
 
 # ──────────────────────────────────────────────
 # Schema mappings
-# Map dbt folder paths → Metabase target schemas
+# Map dbt folder paths → Metabase target schemas.
+# The transform_schema_prefix (default: "transforms_") is automatically
+# prepended, so "staging" becomes "transforms_staging" in Metabase.
+# This keeps transforms separate from the original dbt-produced tables.
 # ──────────────────────────────────────────────
+transform_schema_prefix: "transforms_"
+
 schema_mappings:
   - dbt_folder_pattern: "staging/*"
     metabase_schema: "staging"
@@ -82,6 +87,17 @@ dry_run: false
 # "replace" — delete existing and recreate
 # "error" — fail if any exist
 on_conflict: "skip"
+
+# ──────────────────────────────────────────────
+# Remap schema map (optional)
+# Maps dbt schemas → transform schemas for the `remap` command.
+# Auto-derived from schema_mappings + transform_schema_prefix if omitted.
+# Only set this if you need custom overrides.
+# ──────────────────────────────────────────────
+# remap_schema_map:
+#   staging: transforms_staging
+#   intermediate: transforms_intermediate
+#   marts: transforms_marts
 
 # Model filters (glob patterns)
 # include_models: ["stg_*", "fct_*", "dim_*"]
