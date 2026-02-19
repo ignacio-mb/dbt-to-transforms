@@ -1,6 +1,7 @@
 # dbt-to-metabase
-
+```
 **Test heavily before running in production. Back up Metabase's Application database before using**
+```
 
 Migrate dbt models into **Metabase Transforms** — a new Metabase feature that lets you write query results back to your database and reuse them as data sources.
 
