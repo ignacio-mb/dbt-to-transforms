@@ -1,5 +1,7 @@
 # dbt-to-metabase
 
+**Test heavily before running in production. Back up Metabase's Application database before using**
+
 Migrate dbt models into **Metabase Transforms** — a new Metabase feature that lets you write query results back to your database and reuse them as data sources.
 
 This tool reads your dbt project from GitHub, rewrites the Jinja-templated SQL into plain SQL, resolves the dependency graph, and creates Metabase transforms (with tags and scheduled jobs) via the Metabase API.
