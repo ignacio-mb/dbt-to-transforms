@@ -84,7 +84,7 @@ class Migrator:
         logger.info("Step 4/6: Executing migration plan...")
         self._execute_plan()
 
-        # Pre-transform snapshot: capture dbt table state before transforms overwrite
+        # Pre-transform snapshot: capture dbt table state for comparison
         if self.enable_validation:
             logger.info("Step 4.5/6: Snapshotting dbt tables for validation...")
             self._snapshot_for_validation()
@@ -92,9 +92,9 @@ class Migrator:
         logger.info("Step 5/6: Running transforms in dependency order...")
         self._run_transforms()
 
-        # Post-transform validation: compare transform output against dbt snapshots
+        # Post-transform validation: compare transform tables against dbt tables
         if self.enable_validation:
-            logger.info("Step 5.5/6: Validating transform output against dbt data...")
+            logger.info("Step 5.5/6: Validating transforms against dbt data...")
             self.validation_report = self._validate_transforms()
 
         if self.config.remote_sync.enabled:
@@ -536,32 +536,47 @@ class Migrator:
 
     def _snapshot_for_validation(self):
         # type: () -> None
-        """Capture dbt-produced table state before transforms overwrite them."""
+        """Capture dbt-produced table state in their ORIGINAL schemas.
+
+        Since transforms write to transforms_* schemas, the original dbt
+        tables are untouched.  We snapshot them so we can compare later.
+        """
         assert self.plan is not None
 
         self.validator = DataValidator(self.client, self.config.metabase.database_id)
 
-        # Collect all (schema, table) pairs that transforms will write to
-        tables = [
-            (t.schema_name, t.table_name)
-            for t in self.plan.transforms
-            if t.transform_id  # Only transforms that were actually created
-        ]
+        prefix = self.config.transform_schema_prefix
 
-        if not tables:
+        # Build pairs: (dbt_schema, table_name), (transform_schema, table_name)
+        self._validation_pairs = []  # type: List[tuple]
+        for t in self.plan.transforms:
+            if not t.transform_id:
+                continue
+            # t.schema_name is the transform schema (e.g. transforms_staging)
+            # Strip prefix to get the dbt schema (e.g. staging)
+            dbt_schema = t.schema_name
+            if prefix and dbt_schema.startswith(prefix):
+                dbt_schema = dbt_schema[len(prefix):]
+            self._validation_pairs.append(
+                ((dbt_schema, t.table_name), (t.schema_name, t.table_name))
+            )
+
+        if not self._validation_pairs:
             logger.warning("No transforms to validate (none created)")
             return
 
-        self.validator.snapshot_tables(tables)
+        # Snapshot the dbt side
+        dbt_tables = [pair[0] for pair in self._validation_pairs]
+        self.validator.snapshot_tables(dbt_tables)
 
     def _validate_transforms(self):
         # type: () -> ValidationReport
-        """Compare transform output against pre-transform dbt snapshots."""
-        if not self.validator:
+        """Compare transform output against dbt tables (cross-schema)."""
+        if not self.validator or not getattr(self, '_validation_pairs', None):
             logger.warning("No validator available — skipping validation")
             return ValidationReport()
 
-        report = self.validator.validate()
+        report = self.validator.validate_cross_schema(self._validation_pairs)
         print(self.validator.format_report(report))
         return report
 
@@ -569,9 +584,9 @@ class Migrator:
         # type: (Optional[Dict[str, str]]) -> ValidationReport
         """Standalone validation: compare dbt tables against transform tables.
 
-        This is used when dbt tables exist in one schema and transform tables
-        exist in another (same names). If *pre_snapshots_schema_map* is None,
-        it snapshots and validates the same tables (useful after a run).
+        Snapshots each model's dbt table (original schema) and compares it
+        against the corresponding transform table (transforms_* schema).
+        Seeds are skipped since they are not created as transforms.
         """
         logger.info("=" * 60)
         logger.info("dbt -> Metabase Transforms: VALIDATE")
@@ -588,29 +603,36 @@ class Migrator:
             raise MigrationError("Cannot validate: {}".format(e))
 
         model_lookup = {m.name: m for m in self.project.models.values()}
-        schema_overrides = {}  # type: Dict[str, str]
+
+        # Build the dbt→transform schema mapping
         prefix = self.config.transform_schema_prefix
+        schema_overrides = {}  # type: Dict[str, str]
         for mapping in self.config.schema_mappings:
             schema_overrides[mapping.dbt_folder_pattern] = "{}{}".format(
                 prefix, mapping.metabase_schema
             )
 
-        tables = []  # type: List[tuple]
+        # Build cross-schema pairs: (dbt_schema, table) vs (transforms_schema, table)
+        table_pairs = []  # type: List[tuple]
         for model_name in execution_order:
             model = model_lookup.get(model_name)
             if not model or model.config.get("is_seed"):
                 continue
-            schema = self._resolve_schema(model, schema_overrides)
-            tables.append((schema, model.name))
 
-        logger.info("Step 3/3: Validating %d tables...", len(tables))
+            transform_schema = self._resolve_schema(model, schema_overrides)
+            # Strip prefix to get original dbt schema
+            dbt_schema = transform_schema
+            if prefix and dbt_schema.startswith(prefix):
+                dbt_schema = dbt_schema[len(prefix):]
+
+            table_pairs.append(
+                ((dbt_schema, model.name), (transform_schema, model.name))
+            )
+
+        logger.info("Step 3/3: Validating %d tables (dbt vs transforms)...", len(table_pairs))
 
         validator = DataValidator(self.client, self.config.metabase.database_id)
-
-        # For standalone validation, we snapshot + validate in one pass.
-        # This checks that all transform tables exist and have sane data.
-        validator.snapshot_tables(tables)
-        report = validator.validate()
+        report = validator.validate_cross_schema(table_pairs)
         print(validator.format_report(report))
 
         self.validation_report = report
@@ -714,12 +736,29 @@ class Migrator:
 
         remap_map = self.config.remap_schema_map
         if not remap_map:
-            raise MigrationError(
-                "remap_schema_map required. Map dbt schemas to transform schemas, e.g.:\n"
-                "remap_schema_map:\n"
-                "  dbt_models_staging: transforms_staging\n"
-                "  dbt_models_marts: transforms_marts"
-            )
+            # Auto-derive from schema_mappings + transform_schema_prefix
+            prefix = self.config.transform_schema_prefix
+            if self.config.schema_mappings and prefix:
+                remap_map = {}
+                for mapping in self.config.schema_mappings:
+                    dbt_schema = mapping.metabase_schema
+                    transform_schema = "{}{}".format(prefix, dbt_schema)
+                    remap_map[dbt_schema] = transform_schema
+                # Also include the default schema
+                default = self.config.metabase.default_schema
+                if default and default not in remap_map:
+                    remap_map[default] = "{}{}".format(prefix, default)
+                logger.info(
+                    "Auto-derived remap_schema_map from schema_mappings: %s",
+                    remap_map,
+                )
+            else:
+                raise MigrationError(
+                    "remap_schema_map required. Map dbt schemas to transform schemas, e.g.:\n"
+                    "remap_schema_map:\n"
+                    "  staging: transforms_staging\n"
+                    "  marts: transforms_marts"
+                )
 
         results = {
             "table_mappings": [],

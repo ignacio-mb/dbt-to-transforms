@@ -56,6 +56,9 @@ dbt-to-metabase plan --config config.yaml --output plan.json
 # 4. Run the migration
 dbt-to-metabase migrate --config config.yaml
 
+# 4.1 Run the migraiton and validate the data after migration
+dbt-to-metabase migrate --config config.yaml --validate
+
 # 5. Remap content to use transforms tables instead
 dbt-to-metabase remap --config config.yaml
 

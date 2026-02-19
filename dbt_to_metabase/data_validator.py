@@ -298,6 +298,122 @@ class DataValidator:
         else:
             targets = tables
 
+        return self._run_validation(targets)
+
+    def validate_cross_schema(self, table_pairs):
+        # type: (List[Tuple[Tuple[str, str], Tuple[str, str]]]) -> ValidationReport
+        """Compare dbt tables against transform tables in different schemas.
+
+        *table_pairs* is a list of ((dbt_schema, table), (transform_schema, table)).
+        The dbt side is snapshotted first, then each transform table is compared
+        against its dbt counterpart.
+
+        This is the primary validation mode since transforms live in transforms_*
+        schemas while dbt tables remain in their original schemas.
+        """
+        # Phase 1: snapshot all dbt tables
+        dbt_tables = [pair[0] for pair in table_pairs]
+        self.snapshot_tables(dbt_tables)
+
+        # Phase 2: compare each transform table against its dbt snapshot
+        report = ValidationReport(total_tables=len(table_pairs))
+        logger.info("=" * 60)
+        logger.info("DATA VALIDATION — comparing %d tables (dbt vs transforms)", len(table_pairs))
+        logger.info("=" * 60)
+
+        for (dbt_schema, table_name), (tf_schema, tf_table) in table_pairs:
+            dbt_key = "{}.{}".format(dbt_schema, table_name)
+            pre_snapshot = self._snapshots.get(dbt_key)
+
+            if not pre_snapshot:
+                result = ValidationResult(
+                    table_name=table_name,
+                    schema_name=tf_schema,
+                    skipped=True,
+                    skip_reason="No dbt snapshot for {}".format(dbt_key),
+                )
+                report.results.append(result)
+                report.tables_skipped += 1
+                logger.warning("  SKIP %s.%s — no dbt snapshot for %s", tf_schema, tf_table, dbt_key)
+                continue
+
+            if pre_snapshot.error:
+                result = ValidationResult(
+                    table_name=table_name,
+                    schema_name=tf_schema,
+                    skipped=True,
+                    skip_reason="dbt snapshot failed: {}".format(pre_snapshot.error),
+                )
+                report.results.append(result)
+                report.tables_skipped += 1
+                logger.warning(
+                    "  SKIP %s.%s — dbt snapshot error: %s",
+                    tf_schema, tf_table, pre_snapshot.error,
+                )
+                continue
+
+            # Take a snapshot of the transform table
+            post_snapshot = self._take_snapshot(tf_schema, tf_table)
+
+            if post_snapshot.error:
+                result = ValidationResult(
+                    table_name=table_name,
+                    schema_name=tf_schema,
+                    passed=False,
+                    checks=[CheckResult(
+                        check_name="table_exists",
+                        passed=False,
+                        message="Transform table {}.{} error: {}".format(
+                            tf_schema, tf_table, post_snapshot.error
+                        ),
+                    )],
+                )
+                report.results.append(result)
+                report.tables_failed += 1
+                logger.error(
+                    "  FAIL %s.%s — transform snapshot error: %s",
+                    tf_schema, tf_table, post_snapshot.error,
+                )
+                continue
+
+            # Compare dbt snapshot vs transform snapshot
+            result = self._compare_snapshots(pre_snapshot, post_snapshot)
+            # Override the schema to show the comparison clearly
+            result.schema_name = "{} vs {}".format(dbt_schema, tf_schema)
+            report.results.append(result)
+
+            if result.passed:
+                report.tables_passed += 1
+                logger.info(
+                    "  PASS %s — %s.%s == %s.%s",
+                    table_name, dbt_schema, table_name, tf_schema, tf_table,
+                )
+            else:
+                report.tables_failed += 1
+                for check in result.checks:
+                    if not check.passed:
+                        logger.error(
+                            "  FAIL %s — %s: %s",
+                            table_name, check.check_name, check.message,
+                        )
+
+        logger.info("-" * 60)
+        logger.info(
+            "VALIDATION SUMMARY: %d passed, %d failed, %d skipped (of %d total)",
+            report.tables_passed, report.tables_failed,
+            report.tables_skipped, report.total_tables,
+        )
+        if report.all_passed:
+            logger.info("ALL TABLES PASSED ✓")
+        else:
+            logger.error("VALIDATION FAILURES DETECTED ✗")
+        logger.info("=" * 60)
+
+        return report
+
+    def _run_validation(self, targets):
+        # type: (List[Tuple[str, str]]) -> ValidationReport
+        """Compare same-schema snapshots (snapshot vs re-read of same tables)."""
         report = ValidationReport(total_tables=len(targets))
         logger.info("=" * 60)
         logger.info("DATA VALIDATION — comparing %d tables", len(targets))
