@@ -171,7 +171,9 @@ class GitHubDbtParser:
         models_cfg = raw.get("models", {})
         project_name = raw.get("name", "")
         if project_name in models_cfg:
-            return models_cfg[project_name].get("schema", "public")
+            proj = models_cfg[project_name]
+            # dbt_project.yml uses "+schema" (with +) or "schema" (without)
+            return proj.get("schema") or proj.get("+schema") or "public"
         return "public"
 
     def _parse_schema_files(self, project):
@@ -329,16 +331,27 @@ class GitHubDbtParser:
         if not configs:
             return default
 
+        # dbt_project.yml uses a "+" prefix convention for config keys
+        # (e.g. "+schema", "+materialized", "+tags").  Check both forms so
+        # that configs written either way are picked up correctly.
+        def _get_key(d, k, fallback):
+            # type: (dict, str, Any) -> Any
+            if k in d:
+                return d[k]
+            if ("+{}".format(k)) in d:
+                return d["+{}".format(k)]
+            return fallback
+
         parts = [p for p in folder.split("/") if p]
         current = configs
         for proj_key in current:
             if isinstance(current[proj_key], dict):
                 sub = current[proj_key]
-                val = sub.get(key, default)
+                val = _get_key(sub, key, default)
                 for part in parts:
                     if part in sub and isinstance(sub[part], dict):
                         sub = sub[part]
-                        val = sub.get(key, val)
+                        val = _get_key(sub, key, val)
                 return val
         return default
 

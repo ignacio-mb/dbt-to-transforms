@@ -1,9 +1,15 @@
 """
 Rewrite dbt Jinja-templated SQL into plain SQL compatible with Metabase transforms.
+
+In Metabase Transforms every model becomes a physical table, regardless of its
+dbt materialization (view, table, incremental, **or ephemeral**).  Therefore
+ref() calls to ephemeral models are resolved to ``schema.table_name`` just like
+any other model -- there is no CTE inlining.
 """
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 import re
 from typing import Dict, List, Optional, Tuple
@@ -65,11 +71,7 @@ def _split_macro_args(args_str):
 
 def _strip_jinja_string(s):
     # type: (str) -> str
-    """Strip outer Jinja-string quotes from a macro arg.
-    'col_name'  -> col_name
-    "sum(x)"    -> sum(x)
-    sum(x)      -> sum(x)   (unquoted, left alone)
-    """
+    """Strip outer Jinja-string quotes from a macro arg."""
     s = s.strip()
     if (s.startswith("'") and s.endswith("'")) or (
         s.startswith('"') and s.endswith('"')
@@ -79,42 +81,22 @@ def _strip_jinja_string(s):
 
 
 def _eval_jinja_string_concat(s, project_vars=None):
-    # type: (str, Optional[Dict[str, Any]]) -> str
-    """Evaluate Jinja ~ string-concatenation and resolve bare var() calls.
-
-    dbt macro args often build SQL strings using Jinja ~ concatenation:
-        start_date="cast('" ~ var('start_date') ~ "' as date)"
-
-    This is valid Jinja-in-macro-context syntax.  Note that var() here is
-    NOT wrapped in {{ }}, so _replace_vars (which matches {{ var(...) }})
-    never fires on it.  This function handles both steps:
-
-    Step A — resolve bare var() calls using project_vars:
-        var('start_date')  ->  '2020-01-01'   (single-quoted string literal)
-
-    Step B — collapse ~ concatenation between adjacent string literals:
-        "cast('" ~ '2020-01-01' ~ "' as date)"
-            ->  "cast('2020-01-01' as date)"
-
-    Result is a normal double-quoted string that the kwarg regex can parse.
-    """
-    # ── Step A: resolve bare var() calls ────────────────────────────────────
+    # type: (str, Optional[Dict]) -> str
+    """Evaluate Jinja ~ string-concatenation and resolve bare var() calls."""
     if project_vars:
         bare_var_pat = re.compile(
             r"""var\(\s*['"]([^'"]+)['"]\s*(?:,\s*(?:['"]([^'"]*)['"]|([^\)]*)))?\s*\)""",
             re.DOTALL,
         )
         def var_replacer(mv):
-            # type: (re.Match) -> str
             var_name = mv.group(1)
             default  = mv.group(2) if mv.group(2) is not None else mv.group(3)
             val = project_vars.get(var_name, default)
             if val is None:
-                return mv.group(0)          # leave untouched — no value available
-            return "'{}'".format(str(val))  # emit as single-quoted string literal
+                return mv.group(0)
+            return "'{}'".format(str(val))
         s = bare_var_pat.sub(var_replacer, s)
 
-    # ── Step B: collapse ~ between adjacent string literals ──────────────────
     tilde_pat = re.compile(
         r"""(?:'([^']*)'|"([^"]*)")\s*~\s*(?:'([^']*)'|"([^"]*)")""",
         re.DOTALL,
@@ -142,6 +124,14 @@ class SqlRewriter:
 
     def rewrite(self, model):
         # type: (DbtModel) -> Tuple[str, List[str]]
+        """Rewrite a dbt model's raw SQL into plain SQL for Metabase transforms.
+
+        ALL ref() calls -- including those to ephemeral models -- are resolved to
+        ``schema.table_name``.  Metabase transforms always create tables, so
+        every model will have a physical table to point at.
+        """
+        self._last_checkpoint_column = None  # type: Optional[str]
+
         sql = model.raw_sql
         warnings = []  # type: List[str]
 
@@ -151,7 +141,7 @@ class SqlRewriter:
         # 2. Strip {{ config(...) }}
         sql = CONFIG_PATTERN.sub("", sql)
 
-        # 3. Replace {{ ref('model_name') }}
+        # 3. Replace {{ ref('model_name') }} -- all models resolve to schema.table
         sql = self._replace_refs(sql, model, warnings)
 
         # 4. Replace {{ source('source_name', 'table_name') }}
@@ -163,11 +153,10 @@ class SqlRewriter:
         # 6. Handle incremental blocks
         sql = self._handle_incremental(sql, model, warnings)
 
-        # 6.5  MACRO TRANSLATION — must run BEFORE steps 7/8 so known macros
-        #      are expanded to real SQL instead of being nuked to NULL.
+        # 6.5  Macro translation
         sql = self._translate_macros(sql, model, warnings)
 
-        # 7. Strip any remaining Jinja blocks  {% ... %}
+        # 7. Strip remaining Jinja blocks  {% ... %}
         remaining_blocks = JINJA_BLOCK_PATTERN.findall(sql)
         if remaining_blocks:
             for block in remaining_blocks:
@@ -187,8 +176,7 @@ class SqlRewriter:
                 )
             sql = JINJA_EXPR_PATTERN.sub("NULL", sql)
 
-        # 8.5  Fix Python/BigQuery-style JSONB bracket access left after Jinja stripping.
-        #      col['key']  ->  col->>'key'
+        # 8.5  Fix Python/BigQuery-style JSONB bracket access.
         sql = self._fix_json_bracket_access(sql)
 
         # 9. Check if NULL replacement produced structurally broken SQL.
@@ -207,12 +195,11 @@ class SqlRewriter:
         return sql, warnings
 
     # ------------------------------------------------------------------
-    # Step 6.5 — Macro translation
+    # Macro translation
     # ------------------------------------------------------------------
 
     def _translate_macros(self, sql, model, warnings):
         # type: (str, DbtModel, List[str]) -> str
-        """Translate known dbt / dbt_utils macros into native PostgreSQL."""
         sql = self._translate_days_between(sql, warnings)
         sql = self._translate_safe_divide(sql, warnings)
         sql = self._translate_date_spine(sql, warnings)
@@ -220,117 +207,55 @@ class SqlRewriter:
 
     def _translate_days_between(self, sql, warnings):
         # type: (str, List[str]) -> str
-        """
-        {{ days_between('start_col', 'end_col') }}
-            -> (end_col::date - start_col::date)
-
-        PostgreSQL date subtraction returns INTEGER days.
-        Args may be column names or any SQL date expression.
-        """
         pattern = re.compile(
             r"\{\{\s*days_between\(\s*(.*?)\s*\)\s*\}\}", re.DOTALL
         )
-
         def replacer(m):
-            # type: (re.Match) -> str
             args = _split_macro_args(m.group(1))
             if len(args) != 2:
                 warnings.append(
-                    "days_between: expected 2 args, got {}; replaced with NULL".format(
-                        len(args)
-                    )
+                    "days_between: expected 2 args, got {}; replaced with NULL".format(len(args))
                 )
                 return "NULL"
             start = _strip_jinja_string(args[0])
             end = _strip_jinja_string(args[1])
             return "({end}::date - {start}::date)".format(start=start, end=end)
-
         return pattern.sub(replacer, sql)
 
     def _translate_safe_divide(self, sql, warnings):
         # type: (str, List[str]) -> str
-        """
-        {{ safe_divide(numerator, denominator) }}
-            -> (numerator)::numeric / NULLIF(denominator, 0)
-
-        Both args may be Jinja string literals ('col') or raw SQL (sum(x)).
-        If the denominator already contains NULLIF the outer wrap is redundant
-        but valid: NULLIF(NULLIF(x,0), 0) == NULLIF(x, 0).
-        """
         pattern = re.compile(
             r"\{\{\s*safe_divide\(\s*(.*?)\s*\)\s*\}\}", re.DOTALL
         )
-
         def replacer(m):
-            # type: (re.Match) -> str
             args = _split_macro_args(m.group(1))
             if len(args) != 2:
                 warnings.append(
-                    "safe_divide: expected 2 args, got {}; replaced with NULL".format(
-                        len(args)
-                    )
+                    "safe_divide: expected 2 args, got {}; replaced with NULL".format(len(args))
                 )
                 return "NULL"
             num = _strip_jinja_string(args[0])
             den = _strip_jinja_string(args[1])
             return "({num})::numeric / NULLIF({den}, 0)".format(num=num, den=den)
-
         return pattern.sub(replacer, sql)
 
     def _translate_date_spine(self, sql, warnings):
         # type: (str, List[str]) -> str
-        """
-        {{ dbt_utils.date_spine(
-               datepart="day",
-               start_date="cast('2020-01-01' as date)",
-               end_date="cast('2030-12-31' as date)"
-           ) }}
-
-        ->  SELECT generate_series(
-                (cast('2020-01-01' as date))::timestamp,
-                (cast('2030-12-31' as date))::timestamp,
-                '1 day'::interval
-            )::date AS date_day
-
-        The output is a bare SELECT so it slots directly into a CTE body:
-            with date_spine as (
-                SELECT generate_series(...)::date AS date_day
-            )
-        which is valid PostgreSQL.
-        """
         pattern = re.compile(
             r"\{\{\s*dbt_utils\.date_spine\(\s*(.*?)\s*\)\s*\}\}", re.DOTALL
         )
-
         def replacer(m):
-            # type: (re.Match) -> str
-            # Evaluate Jinja ~ string concatenation BEFORE parsing kwargs.
-            # e.g. start_date="cast('" ~ '2020-01-01' ~ "' as date)"
-            #   -> start_date="cast('2020-01-01' as date)"
             raw = _eval_jinja_string_concat(m.group(1), self.project.vars)
-            # Parse  key="value"  or  key='value'  keyword args
-            kw_pat = re.compile(
-                r'(\w+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\')', re.DOTALL
-            )
-            kwargs = {}  # type: Dict[str, str]
+            kw_pat = re.compile(r'(\w+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\')', re.DOTALL)
+            kwargs = {}
             for kw_m in kw_pat.finditer(raw):
                 key = kw_m.group(1)
-                val = (
-                    kw_m.group(2)
-                    if kw_m.group(2) is not None
-                    else kw_m.group(3)
-                )
+                val = kw_m.group(2) if kw_m.group(2) is not None else kw_m.group(3)
                 kwargs[key] = val.strip()
-
             datepart = kwargs.get("datepart", "day").lower()
-            start_date = kwargs.get(
-                "start_date", "current_date - interval '1 year'"
-            )
+            start_date = kwargs.get("start_date", "current_date - interval '1 year'")
             end_date = kwargs.get("end_date", "current_date")
-            interval = _DATEPART_TO_INTERVAL.get(
-                datepart, "1 {}".format(datepart)
-            )
-
+            interval = _DATEPART_TO_INTERVAL.get(datepart, "1 {}".format(datepart))
             return (
                 "SELECT generate_series(\n"
                 "        ({start})::timestamp,\n"
@@ -340,30 +265,21 @@ class SqlRewriter:
                     start=start_date, end=end_date, interval=interval
                 )
             )
-
         return pattern.sub(replacer, sql)
 
     # ------------------------------------------------------------------
-    # Step 8.5 — JSONB bracket access fix
+    # JSONB bracket access fix
     # ------------------------------------------------------------------
 
     def _fix_json_bracket_access(self, sql):
         # type: (str) -> str
-        """
-        Convert Python/BigQuery JSONB bracket access to PostgreSQL operators.
-            col['key']   ->  col->>'key'   (returns text)
-            col["key"]   ->  col->>'key'
-        Integer index access (col[0]) is not remapped here.
-        """
         sq = re.compile(r"(\b\w+(?:\.\w+)*)\['([^']+)'\]")
         dq = re.compile(r'(\b\w+(?:\.\w+)*)\["([^"]+)"\]')
         original = sql
         sql = sq.sub(lambda mo: mo.group(1) + "->>" + "'" + mo.group(2) + "'", sql)
         sql = dq.sub(lambda mo: mo.group(1) + "->>" + "'" + mo.group(2) + "'", sql)
         if sql != original:
-            logger.info(
-                "Fixed Python-style JSON bracket access -> PostgreSQL ->> operator"
-            )
+            logger.info("Fixed Python-style JSON bracket access -> PostgreSQL ->> operator")
         return sql
 
     # ------------------------------------------------------------------
@@ -372,7 +288,6 @@ class SqlRewriter:
 
     def _is_structurally_broken(self, sql):
         # type: (str) -> bool
-        """Detect if NULL replacement left the SQL structurally invalid."""
         if re.search(r"\bas\b\s*\(\s*NULL\s*\)", sql, re.IGNORECASE | re.DOTALL):
             logger.warning(
                 "_is_structurally_broken: NULL CTE body found. "
@@ -387,13 +302,17 @@ class SqlRewriter:
         return False
 
     # ------------------------------------------------------------------
-    # Ref / source / var / incremental helpers (unchanged from original)
+    # Ref / source / var / incremental helpers
     # ------------------------------------------------------------------
 
     def _replace_refs(self, sql, model, warnings):
         # type: (str, DbtModel, List[str]) -> str
+        """Replace {{ ref('model_name') }} with schema.table_name.
+
+        ALL models -- including ephemeral -- are resolved to schema.table_name
+        because in Metabase Transforms every model becomes a physical table.
+        """
         def replacer(match):
-            # type: (re.Match) -> str
             ref_name = match.group(1)
             target = self._model_lookup.get(ref_name)
             if target:
@@ -413,7 +332,6 @@ class SqlRewriter:
     def _replace_sources(self, sql, model, warnings):
         # type: (str, DbtModel, List[str]) -> str
         def replacer(match):
-            # type: (re.Match) -> str
             source_name = match.group(1)
             table_name = match.group(2)
             source = self.project.sources.get(source_name)
@@ -438,7 +356,6 @@ class SqlRewriter:
     def _replace_vars(self, sql, warnings):
         # type: (str, List[str]) -> str
         def replacer(match):
-            # type: (re.Match) -> str
             var_name = match.group(1)
             default = match.group(2) if match.group(2) else None
             val = self.project.vars.get(var_name, default)
@@ -504,8 +421,13 @@ class SqlRewriter:
 
     def _resolve_schema(self, model):
         # type: (DbtModel) -> str
-        if model.folder in self.schema_overrides:
-            return self.schema_overrides[model.folder]
+        """Resolve the target schema for a model.
+
+        Uses fnmatch so glob patterns like ``staging/*`` work correctly.
+        """
+        for pattern, schema in self.schema_overrides.items():
+            if fnmatch.fnmatch(model.folder, pattern) or model.folder == pattern:
+                return schema
         if model.schema_name:
             return model.schema_name
         return self.default_schema

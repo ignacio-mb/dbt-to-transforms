@@ -105,9 +105,9 @@ class MetabaseClient:
     def create_transform(
         self, name, query, database_id, schema_name, table_name,
         description="", folder_id=None, transform_type="query",
-        is_incremental=False, checkpoint_column=None,
+        is_incremental=False, checkpoint_column=None, tag_ids=None,
     ):
-        # type: (str, str, int, str, str, str, Optional[int], str, bool, Optional[str]) -> dict
+        # type: (str, str, int, str, str, str, Optional[int], str, bool, Optional[str], Optional[List[int]]) -> dict
         #
         # Metabase API schema (from 400 response):
         #   source.type          -> must always equal "query" (never "incremental-query")
@@ -146,6 +146,12 @@ class MetabaseClient:
             payload["description"] = description
         if folder_id:
             payload["collection_id"] = folder_id
+
+        # Include tag_ids in the create payload. Metabase does not expose a
+        # working POST /api/transform/{id}/tag endpoint in all versions — the
+        # only reliable way to associate tags with a transform is at creation.
+        if tag_ids:
+            payload["tag_ids"] = tag_ids
 
         result = self._post("transform", json=payload)
         logger.info(
@@ -294,10 +300,13 @@ class MetabaseClient:
             self._post("ee/remote-sync/export")
             logger.info("Triggered remote sync (export)")
         except MetabaseApiError as e:
-            if e.status_code == 404:
-                logger.warning("Remote sync not available (may not be enabled)")
-            else:
+            if e.status_code in (400, 404):
+                # 404 → remote sync feature not enabled in this Metabase edition.
+                # 400 → remote sync not configured (no git repo set up).
+                # Both are expected non-fatal conditions; re-raise so the
+                # migrator's _trigger_remote_sync() can log it as a warning.
                 raise
+            raise
 
     def wait_for_run(self, transform_id, run_id, timeout=300, poll_interval=5):
         # type: (int, int, int, int) -> dict
@@ -367,11 +376,118 @@ class MetabaseClient:
                 return True
         return False
 
+    def retire_stale_table(self, schema_name, table_name, database_id):
+        # type: (str, str, int) -> bool
+        """Remove a stale table so a new transform can target the same schema+table.
+
+        The Create Transform API returns 403 "A table with that name already
+        exists" when either:
+          (a) Metabase's metadata catalog has an entry for schema.table, OR
+          (b) The physical table/view still exists in the connected database.
+
+        Setting active=false on the catalog entry handles case (a), but not (b).
+        To handle (b) we execute DROP TABLE / DROP VIEW via Metabase's own query
+        execution endpoint, which uses its existing DB connection so no separate
+        psql or DB credentials are needed in the migrator.
+
+        Returns True if a matching catalog entry was found and cleaned up,
+        False if no entry was found or cleanup failed.
+        """
+        tables = self.list_tables(database_id)
+        for t in tables:
+            if (
+                t.get("schema", "").lower() == schema_name.lower()
+                and t.get("name", "").lower() == table_name.lower()
+            ):
+                table_id = t["id"]
+
+                # Step 1: deactivate the catalog entry.
+                try:
+                    self._put(
+                        "table/{}".format(table_id),
+                        json={"active": False},
+                    )
+                    logger.info(
+                        "Deactivated catalog entry %s.%s (id=%d)",
+                        schema_name, table_name, table_id,
+                    )
+                except MetabaseApiError as e:
+                    logger.warning(
+                        "Could not deactivate catalog entry %s.%s (id=%d): %s",
+                        schema_name, table_name, table_id, e,
+                    )
+                    return False
+
+                # Step 2: drop the physical table/view from the database.
+                # Metabase checks the live DB when creating a transform, so a
+                # stale catalog entry alone is not enough — the physical object
+                # must also be gone. We issue DROPs through Metabase's own query
+                # execution so no direct DB connection is needed here.
+                #
+                # IMPORTANT: Metabase's /api/dataset endpoint only executes the
+                # FIRST statement in a multi-statement query. We must issue
+                # DROP TABLE and DROP VIEW as two separate requests, otherwise
+                # the VIEW drop is silently skipped (staging models are views).
+                dropped = False
+                for drop_sql, obj_type in [
+                    (
+                        'DROP TABLE IF EXISTS "{schema}"."{table}" CASCADE'.format(
+                            schema=schema_name, table=table_name
+                        ),
+                        "table",
+                    ),
+                    (
+                        'DROP VIEW IF EXISTS "{schema}"."{table}" CASCADE'.format(
+                            schema=schema_name, table=table_name
+                        ),
+                        "view",
+                    ),
+                ]:
+                    try:
+                        self.execute_query(database_id, drop_sql)
+                        dropped = True
+                        logger.info(
+                            "Dropped physical %s %s.%s from database",
+                            obj_type, schema_name, table_name,
+                        )
+                    except MetabaseApiError as e:
+                        logger.debug(
+                            "DROP %s %s.%s: %s (may not be that type, continuing)",
+                            obj_type, schema_name, table_name, e,
+                        )
+
+                if not dropped:
+                    logger.warning(
+                        "Could not drop %s.%s via either TABLE or VIEW — "
+                        "transform creation may still fail",
+                        schema_name, table_name,
+                    )
+                    # Don't return False -- the catalog deactivation succeeded;
+                    # let the caller attempt the create and surface any error.
+
+                return True
+        return False
+
     def get_table_fields(self, table_id):
         # type: (int) -> List[dict]
         """Get fields/columns for a table."""
         meta = self._get("table/{}/query_metadata".format(table_id))
         return meta.get("fields", [])
+
+    def execute_query(self, database_id, sql):
+        # type: (int, str) -> dict
+        """Execute a native SQL query against the given database via Metabase.
+
+        Uses POST /api/dataset, which runs the query through Metabase's existing
+        database connection.  This lets the migrator issue DDL statements (DROP,
+        etc.) without needing a separate direct database connection or psql.
+        """
+        payload = {
+            "database": database_id,
+            "type": "native",
+            "native": {"query": sql},
+        }
+        return self._post("dataset", json=payload)
 
     # Cards API
 

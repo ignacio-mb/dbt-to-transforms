@@ -1,5 +1,10 @@
 """
 Resolve the execution order of dbt models using topological sort.
+
+In a Metabase Transforms migration **all** dbt models -- including ephemeral
+ones -- are materialized as tables.  Therefore the dependency resolver must
+include ephemeral models in the execution order so that they are created before
+downstream models that reference them.
 """
 
 from __future__ import annotations
@@ -25,8 +30,17 @@ class DependencyResolver:
             m.name: m for m in project.models.values()
         }  # type: Dict[str, DbtModel]
 
-    def resolve(self, exclude_ephemeral=True):
+    def resolve(self, exclude_seeds_only=False):
         # type: (bool) -> List[str]
+        """Return a topologically-sorted list of model names.
+
+        All model materializations (table, view, incremental, **ephemeral**)
+        are included because Metabase transforms materialise everything as
+        physical tables.
+
+        If *exclude_seeds_only* is True, seed pseudo-models are removed from
+        the result (they already exist as raw tables and don't need transforms).
+        """
         graph = defaultdict(set)  # type: Dict[str, Set[str]]
         all_models = set()  # type: Set[str]
 
@@ -66,13 +80,11 @@ class DependencyResolver:
                 "Cyclic dependency detected among models: {}".format(remaining)
             )
 
-        if exclude_ephemeral:
+        if exclude_seeds_only:
             order = [
-                m
-                for m in order
-                if not self._model_by_name.get(m, DbtModel(
-                    unique_id="", name=m, path="", raw_sql=""
-                )).is_ephemeral
+                m for m in order
+                if not (self._model_by_name.get(m) and
+                        self._model_by_name[m].config.get("is_seed"))
             ]
 
         return order
@@ -106,13 +118,23 @@ class DependencyResolver:
 
     def get_execution_layers(self):
         # type: () -> List[List[str]]
-        order = self.resolve(exclude_ephemeral=True)
+        """Return models grouped into parallelisable layers.
+
+        All materializations are included (ephemeral models are materialised
+        as transforms too).  Seeds are excluded because they are raw tables.
+        """
+        order = self.resolve(exclude_seeds_only=True)
         model_layer = {}  # type: Dict[str, int]
 
         for model_name in order:
             model = self._model_by_name.get(model_name)
             if not model:
                 continue
+
+            # Seeds are already excluded from *order* but guard anyway.
+            if model.config.get("is_seed"):
+                continue
+
             deps = [
                 d for d in model.depends_on_models
                 if d in model_layer

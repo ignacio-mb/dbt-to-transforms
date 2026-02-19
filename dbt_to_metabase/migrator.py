@@ -1,6 +1,9 @@
 """
 Core migration engine: orchestrates parsing, rewriting, and API calls
 to migrate dbt models into Metabase transforms.
+
+ALL dbt materializations (table, view, incremental, ephemeral) are converted
+to Metabase transforms (which always create physical tables).
 """
 
 from __future__ import annotations
@@ -55,7 +58,7 @@ class Migrator:
         logger.info("Step 2/6: Resolving model dependencies...")
         resolver = DependencyResolver(self.project)
         try:
-            execution_order = resolver.resolve(exclude_ephemeral=True)
+            execution_order = resolver.resolve(exclude_seeds_only=True)
         except CyclicDependencyError as e:
             raise MigrationError("Cannot migrate: {}".format(e))
 
@@ -122,22 +125,26 @@ class Migrator:
                 )
                 continue
 
-            if model.is_ephemeral:
-                plan.skipped_models.append(
-                    (model.name, "Ephemeral materialization -- not a persisted table")
-                )
-                continue
-
+            # Seeds are raw tables that already exist -- skip them.
             if model.config.get("is_seed"):
                 plan.skipped_models.append(
                     (model.name, "Seed -- already exists as a database table")
                 )
                 continue
 
+            # ---------------------------------------------------------------
+            # Materialization handling: all materializations become transforms.
+            # Log informational warnings for non-table materializations.
+            # ---------------------------------------------------------------
             if model.materialization == DbtMaterialization.VIEW:
                 plan.warnings.append(
                     "Model '{}' is a VIEW in dbt. "
                     "Metabase transforms create tables. Converting to table.".format(model.name)
+                )
+            elif model.materialization == DbtMaterialization.EPHEMERAL:
+                plan.warnings.append(
+                    "Model '{}' is EPHEMERAL in dbt. "
+                    "Metabase transforms create tables. Materializing as table.".format(model.name)
                 )
 
             rewritten_sql, warnings = rewriter.rewrite(model)
@@ -150,8 +157,6 @@ class Migrator:
             tags = self._resolve_tags(model)
             all_tags.update(tags)
 
-            # Get checkpoint column detected by the rewriter (from the
-            # MAX() expression in the incremental block), not unique_key
             checkpoint_col = getattr(rewriter, '_last_checkpoint_column', None)
 
             transform = MetabaseTransform(
@@ -170,6 +175,15 @@ class Migrator:
             plan.transforms.append(transform)
 
         for tag_name in sorted(all_tags):
+            plan.tags.append(MetabaseTag(name=tag_name))
+
+        # Collect tags declared on jobs but not on any model.
+        job_only_tags = set()
+        for job_def in self.config.jobs:
+            for tag in job_def.tags:
+                if tag not in all_tags:
+                    job_only_tags.add(tag)
+        for tag_name in sorted(job_only_tags):
             plan.tags.append(MetabaseTag(name=tag_name))
 
         for job_def in self.config.jobs:
@@ -243,6 +257,8 @@ class Migrator:
             parts.append(model.description)
         parts.append("Migrated from dbt model: {}".format(model.unique_id))
         parts.append("Source: {}".format(model.path))
+        if model.materialization != DbtMaterialization.TABLE:
+            parts.append("Original materialization: {}".format(model.materialization.value))
         if model.depends_on_models:
             parts.append("Dependencies: {}".format(", ".join(model.depends_on_models)))
         return "\n".join(parts)
@@ -293,25 +309,59 @@ class Migrator:
                     logger.warning("Failed to create folder '%s': %s", transform.folder, e)
 
             try:
-                result = self.client.create_transform(
-                    name=transform.name,
-                    query=transform.query,
-                    database_id=transform.database_id,
-                    schema_name=transform.schema_name,
-                    table_name=transform.table_name,
-                    description=transform.description,
-                    folder_id=folder_id,
-                    # Pass incremental settings at creation time so Metabase sets
-                    # source.type="incremental-query" correctly.  A post-creation
-                    # PUT to ee/transform/{id} is silently ignored when the type
-                    # was set to "query" at creation.
-                    is_incremental=transform.is_incremental,
-                    checkpoint_column=transform.checkpoint_column,
-                )
+                transform_tag_ids = [
+                    tag_id_map[t]
+                    for t in transform.tags
+                    if t in tag_id_map
+                ]
+
+                try:
+                    result = self.client.create_transform(
+                        name=transform.name,
+                        query=transform.query,
+                        database_id=transform.database_id,
+                        schema_name=transform.schema_name,
+                        table_name=transform.table_name,
+                        description=transform.description,
+                        folder_id=folder_id,
+                        is_incremental=transform.is_incremental,
+                        checkpoint_column=transform.checkpoint_column,
+                        tag_ids=transform_tag_ids or None,
+                    )
+                except MetabaseApiError as create_err:
+                    if "already exists" not in str(create_err).lower():
+                        raise
+                    logger.warning(
+                        "Transform '%s': '%s' -- retiring stale catalog entry "
+                        "for %s.%s and retrying",
+                        transform.name, create_err,
+                        transform.schema_name, transform.table_name,
+                    )
+                    retired = self.client.retire_stale_table(
+                        transform.schema_name,
+                        transform.table_name,
+                        transform.database_id,
+                    )
+                    if not retired:
+                        logger.warning(
+                            "No stale catalog entry found for %s.%s -- re-raising",
+                            transform.schema_name, transform.table_name,
+                        )
+                        raise
+                    result = self.client.create_transform(
+                        name=transform.name,
+                        query=transform.query,
+                        database_id=transform.database_id,
+                        schema_name=transform.schema_name,
+                        table_name=transform.table_name,
+                        description=transform.description,
+                        folder_id=folder_id,
+                        is_incremental=transform.is_incremental,
+                        checkpoint_column=transform.checkpoint_column,
+                        tag_ids=transform_tag_ids or None,
+                    )
                 transform.transform_id = result["id"]
 
-                # Keep the PUT call as a belt-and-suspenders fallback for older
-                # Metabase versions that may require it separately.
                 if transform.is_incremental and transform.checkpoint_column:
                     try:
                         self.client.set_transform_incremental(
@@ -319,26 +369,12 @@ class Migrator:
                             transform.checkpoint_column,
                         )
                     except MetabaseApiError as e:
-                        # Log but don't fail — the CREATE already embedded the strategy
                         self.plan.warnings.append(
                             "[{}] set_transform_incremental PUT returned error "
                             "(incremental-strategy was already set in CREATE): {}".format(
                                 transform.name, e
                             )
                         )
-
-                for tag_name in transform.tags:
-                    if tag_name in tag_id_map:
-                        try:
-                            self.client.add_tag_to_transform(
-                                transform.transform_id, tag_id_map[tag_name]
-                            )
-                        except MetabaseApiError as e:
-                            self.plan.warnings.append(
-                                "[{}] Failed to add tag '{}': {}".format(
-                                    transform.name, tag_name, e
-                                )
-                            )
 
             except MetabaseApiError as e:
                 self.plan.warnings.append(
@@ -371,25 +407,17 @@ class Migrator:
         # type: () -> None
         assert self.plan is not None
 
-        # Build name -> transform_id map for created transforms
         transform_ids = {}  # type: Dict[str, int]
         for t in self.plan.transforms:
             if t.transform_id:
                 transform_ids[t.name] = t.transform_id
 
-        # Track which transform IDs are incremental.  On the very first migration
-        # the target table does not exist yet, so Metabase marks the transform as
-        # "inactive" and refuses to run the incremental (checkpoint) query.
-        # We must run those with full_refresh=True the first time to create and
-        # populate the table; subsequent runs will use the checkpoint correctly.
         incremental_ids = {
             t.transform_id
             for t in self.plan.transforms
             if t.is_incremental and t.checkpoint_column and t.transform_id
         }
 
-        # Build name -> MigrationTransform so we can look up schema/table/database
-        # when we need to call activate_table before running.
         transform_by_name = {
             t.name: t
             for t in self.plan.transforms
@@ -417,16 +445,9 @@ class Migrator:
                 ", ".join(name for name, _ in layer_transforms),
             )
 
-            # Start all transforms in this layer
             running = []  # type: List[tuple]
             for name, tid in layer_transforms:
                 try:
-                    # Before running, reactivate any stale inactive table entry
-                    # in Metabase's metadata catalog.  This happens when a previous
-                    # migration run created the transform (registering the target
-                    # table in the catalog) but the run failed before populating it,
-                    # leaving Metabase with an active=false entry.  Metabase refuses
-                    # to run any transform targeting an inactive table (500 "is inactive").
                     t_obj = transform_by_name.get(name)
                     if t_obj:
                         try:
@@ -435,13 +456,11 @@ class Migrator:
                             )
                             if not found:
                                 logger.debug(
-                                    "No existing table entry for %s.%s — "
+                                    "No existing table entry for %s.%s -- "
                                     "will be created on first run.",
                                     t_obj.schema_name, t_obj.table_name,
                                 )
                         except MetabaseApiError as ae:
-                            # Non-fatal: log and continue — worst case the run
-                            # fails with the original inactive error.
                             logger.warning(
                                 "activate_table for '%s' failed (non-fatal): %s", name, ae
                             )
@@ -449,7 +468,7 @@ class Migrator:
                     needs_full_refresh = tid in incremental_ids
                     if needs_full_refresh:
                         logger.info(
-                            "Transform '%s' is incremental and newly created — "
+                            "Transform '%s' is incremental and newly created -- "
                             "running full refresh to bootstrap target table.", name
                         )
                     result = self.client.run_transform(tid, full_refresh=needs_full_refresh)
@@ -459,13 +478,11 @@ class Migrator:
                     else:
                         logger.info("Transform '%s' started (no run_id returned)", name)
                 except MetabaseApiError as e:
-                    # If still inactive after reactivation attempt, log clearly.
                     self.plan.warnings.append(
                         "[{}] Failed to run transform: {}".format(name, e)
                     )
                     logger.error("Failed to run transform '%s': %s", name, e)
 
-            # Wait for all transforms in this layer to complete
             for name, tid, run_id in running:
                 try:
                     run = self.client.wait_for_run(tid, run_id, timeout=600)
@@ -571,7 +588,7 @@ class Migrator:
 
         Steps:
         1. List all tables in the target database
-        2. Build table ID mapping: dbt table → transform table (by name)
+        2. Build table ID mapping: dbt table -> transform table (by name)
         3. Find all cards referencing dbt tables
         4. Update each card's query to reference transform tables instead
         """
@@ -595,12 +612,10 @@ class Migrator:
             "warnings": [],
         }  # type: Dict[str, Any]
 
-        # Step 1: Get all tables from Metabase for this database
         logger.info("Step 1/3: Building table ID mapping...")
         database_id = self.config.metabase.database_id
 
         try:
-            # Sync database first to ensure tables are up to date
             self.client.sync_database(database_id)
             import time as _time
             logger.info("Waiting for sync to complete...")
@@ -611,7 +626,6 @@ class Migrator:
         tables = self.client.list_tables(database_id)
         logger.info("Found %d tables in database %d", len(tables), database_id)
 
-        # Build schema.table_name -> table_id lookup
         table_lookup = {}  # type: Dict[str, int]
         for t in tables:
             schema = t.get("schema", "")
@@ -621,10 +635,8 @@ class Migrator:
                 key = "{}.{}".format(schema, name)
                 table_lookup[key] = table_id
 
-        # Build old_table_id -> new_table_id mapping
         table_id_map = {}  # type: Dict[int, int]
         for dbt_schema, transform_schema in remap_map.items():
-            # Find all tables in the dbt schema
             dbt_tables = [
                 t for t in tables
                 if t.get("schema", "") == dbt_schema
@@ -665,7 +677,6 @@ class Migrator:
 
         logger.info("Built %d table ID mappings", len(table_id_map))
 
-        # Build field ID mapping: old_field_id -> new_field_id (matched by column name)
         field_id_map = {}  # type: Dict[int, int]
         for old_table_id, new_table_id in table_id_map.items():
             try:
@@ -695,12 +706,10 @@ class Migrator:
 
         logger.info("Built %d field ID mappings", len(field_id_map))
 
-        # Also build schema name map for native SQL rewriting
         schema_name_map = {}  # type: Dict[str, str]
         for dbt_schema, transform_schema in remap_map.items():
             schema_name_map[dbt_schema] = transform_schema
 
-        # Step 2: Find and update all cards
         logger.info("Step 2/3: Scanning and updating cards...")
         try:
             cards = self.client.list_cards()
@@ -717,7 +726,6 @@ class Migrator:
             if not dataset_query:
                 continue
 
-            # Skip Metabase internal analytics cards
             card_db = dataset_query.get("database")
             if card_db != database_id:
                 continue
@@ -727,14 +735,10 @@ class Migrator:
             changed = False
 
             if query_type == "query" or lib_type == "mbql/query":
-                # MBQL query — update source-table, field refs, and joins
                 changed = self._remap_mbql_query(dataset_query, table_id_map, field_id_map)
             elif query_type == "native":
-                # Native SQL — replace schema references
                 changed = self._remap_native_query(dataset_query, schema_name_map)
             else:
-                # Unknown type but might still have stages (lib/type mbql)
-                # Try field remapping anyway
                 if field_id_map and self._remap_field_ids(dataset_query, field_id_map):
                     changed = True
 
@@ -757,7 +761,6 @@ class Migrator:
                     "name": card_name,
                 })
 
-        # Step 3: Update dashboard cards that have custom queries
         logger.info("Step 3/3: Scanning dashboards for inline card overrides...")
         try:
             dashboards = self.client.list_dashboards()
@@ -779,7 +782,6 @@ class Migrator:
             dashcards = dash.get("dashcards", [])
 
             for dc in dashcards:
-                # Dashboard cards can override queries via card_overrides or parameter_mappings
                 card_data = dc.get("card", {})
                 if not card_data:
                     continue
@@ -818,36 +820,30 @@ class Migrator:
 
     def _remap_mbql_query(self, dataset_query, table_id_map, field_id_map=None):
         # type: (dict, Dict[int, int], Optional[Dict[int, int]]) -> bool
-        """Walk an MBQL dataset_query and replace source-table and field IDs. Returns True if changed."""
         if field_id_map is None:
             field_id_map = {}
 
         changed = False
 
-        # New format: stages array (Metabase v1.50+)
         stages = dataset_query.get("stages", [])
         for stage in stages:
-            # Remap source-table in each stage
             source_table = stage.get("source-table")
             if isinstance(source_table, int) and source_table in table_id_map:
                 stage["source-table"] = table_id_map[source_table]
                 changed = True
 
-            # Remap joins in each stage
             for join in stage.get("joins", []):
                 jt = join.get("source-table")
                 if isinstance(jt, int) and jt in table_id_map:
                     join["source-table"] = table_id_map[jt]
                     changed = True
 
-                # Joins can also have nested stages
                 for join_stage in join.get("stages", []):
                     jst = join_stage.get("source-table")
                     if isinstance(jst, int) and jst in table_id_map:
                         join_stage["source-table"] = table_id_map[jst]
                         changed = True
 
-        # Old format: query object (pre-v1.50)
         query = dataset_query.get("query", {})
         if query:
             source_table = query.get("source-table")
@@ -868,7 +864,6 @@ class Migrator:
                     query["source-query"] = inner_dq["query"]
                     changed = True
 
-        # Remap field IDs throughout the entire structure
         if field_id_map and self._remap_field_ids(dataset_query, field_id_map):
             changed = True
 
@@ -876,16 +871,9 @@ class Migrator:
 
     def _remap_field_ids(self, obj, field_id_map):
         # type: (Any, Dict[int, int]) -> bool
-        """Recursively walk a data structure and remap field ID references.
-
-        Field refs look like: ['field', {...opts...}, <int_field_id>]
-        or: ['field', {...opts...}, <int_field_id>] with field ID as the last element.
-        Also handles: [..., ['field', {...}, <id>], ...] nested anywhere.
-        """
         changed = False
 
         if isinstance(obj, list):
-            # Check if this is a field reference: ['field', <opts>, <int_id>]
             if (
                 len(obj) >= 3
                 and obj[0] == "field"
@@ -895,12 +883,10 @@ class Migrator:
                 obj[-1] = field_id_map[obj[-1]]
                 changed = True
 
-            # Also check for integer field IDs in opts dict (e.g., join conditions)
             for i, item in enumerate(obj):
                 if isinstance(item, (list, dict)):
                     if self._remap_field_ids(item, field_id_map):
                         changed = True
-                # Direct integer field refs in some contexts (e.g., old format)
                 elif isinstance(item, int) and i > 0 and obj[0] == "field" and item in field_id_map:
                     obj[i] = field_id_map[item]
                     changed = True
@@ -915,7 +901,6 @@ class Migrator:
 
     def _remap_native_query(self, dataset_query, schema_name_map):
         # type: (dict, Dict[str, str]) -> bool
-        """Replace schema names in native SQL queries. Returns True if changed."""
         native = dataset_query.get("native", {})
         sql = native.get("query", "")
 
@@ -924,7 +909,6 @@ class Migrator:
 
         new_sql = sql
         for old_schema, new_schema in schema_name_map.items():
-            # Replace "old_schema". and old_schema. patterns
             new_sql = new_sql.replace(
                 '"{}"'.format(old_schema), '"{}"'.format(new_schema)
             )
