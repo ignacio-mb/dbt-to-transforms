@@ -12,6 +12,15 @@ dbt project ──► dbt compile ──► manifest.json ──► schema remap
 
 The tool leverages **dbt's own compiler** to resolve all Jinja templating (`ref()`, `source()`, `var()`, macros, conditionals, packages like `dbt_utils`, etc.) into plain SQL. This means every dbt feature works out of the box — no need for regex-based rewriting or manual macro translation.
 
+### What gets migrated (and what doesn't)
+
+| dbt concept | What happens |
+|---|---|
+| **Models** (table, view, incremental, ephemeral) | Converted to Metabase transforms |
+| **Sources** | Referenced as-is in compiled SQL (no transform created) |
+| **Seeds** | Referenced as-is in compiled SQL (no transform created) |
+| **Snapshots** (SCD2) | Registered in dependency graph but **not migrated** — dbt must keep running `dbt snapshot` |
+
 ## Requirements
 
 - **Python** >= 3.9
@@ -31,12 +40,6 @@ For development:
 
 ```bash
 pip install -e ".[dev]"
-```
-
-After makinkg changes to the source code, run:
-
-```bash
-pip install --force-reinstall --no-deps .
 ```
 
 ## Quick start
@@ -151,6 +154,8 @@ schema_remap:
 
 This rewrites `SELECT * FROM staging.stg_orders` to `SELECT * FROM transforms_staging.stg_orders` in the generated transform queries.
 
+> **Note:** Do not add your snapshot schema (e.g. `dbt_models_snapshot`) or your database name to `schema_remap`. Snapshot tables are managed by dbt and should be referenced by their original schema. The database name is not a schema — adding it causes three-part references like `"database"."schema"."table"` to be incorrectly rewritten.
+
 ### Checkpoint columns (incremental transforms)
 
 Metabase [incremental query transforms](https://www.metabase.com/docs/latest/data-studio/transforms/query-transforms#incremental-query-transforms) use a **checkpoint column** to track which rows have already been processed. On each run, Metabase only processes rows where the checkpoint column value is greater than the last-seen value — similar to dbt's incremental materialization.
@@ -165,7 +170,35 @@ checkpoint_columns:
     column: "event_timestamp"
 ```
 
-**How it works:** Transforms are initially created as non-incremental and run once to bootstrap the target table. After the first successful run, the tool upgrades them to incremental with the specified checkpoint column. Subsequent runs will only process new/changed rows.
+**How it works:** Transforms are initially created as non-incremental and run once to bootstrap the target table. After the first successful run, you must set the checkpoint column manually in the Metabase UI (Data Studio → Transforms → *transform name* → Settings → "Column to check for new values"). The Metabase API for incremental strategy is currently unstable and may change — setting it via the UI is the reliable path.
+
+### dbt snapshots (SCD2 tables)
+
+dbt [snapshots](https://docs.getdbt.com/docs/build/snapshots) are SCD2 (Slowly Changing Dimension Type 2) tables that track row-level changes over time. They add `dbt_valid_from`, `dbt_valid_to`, and `dbt_scd_id` columns to capture historical state.
+
+**Metabase transforms cannot replicate SCD2 logic.** Transforms either overwrite the entire table (full refresh) or append new rows via a checkpoint column. There is no merge/upsert capability needed for change tracking.
+
+This tool handles snapshots by registering them in the dependency graph but **skipping them during transform creation**. They appear in the migration plan under `skipped_models` with the reason "Snapshot (SCD2) — managed by dbt, not migrated". Downstream models that `ref()` a snapshot will still work — the compiled SQL references the snapshot table directly (e.g. `"analytics"."dbt_models_snapshot"."snapshot_account"`), and the Metabase transform reads from that existing table.
+
+**Important: you still need `dbt snapshot` running on a schedule.** Snapshots are not migrated to Metabase — dbt continues to own them. If you stop running `dbt snapshot`, the snapshot tables will go stale and downstream transforms will read outdated data.
+
+A typical setup after migration:
+
+```
+dbt snapshot (cron)  ──► snapshot tables (SCD2, managed by dbt)
+                              │
+                              ▼
+Metabase transforms  ──► read from snapshot tables via SQL
+```
+
+**Config note:** do not add your snapshot schema (e.g. `dbt_models_snapshot`) to `schema_remap`. That schema should remain untouched so transforms read from the same tables that dbt writes to.
+
+If your project uses snapshots and you want to eventually remove dbt entirely, you have a few options:
+
+- **Metabase Python transforms** — write the SCD2 merge logic manually in a Python transform
+- **Freeze the history** — stop `dbt snapshot`, keep existing tables as-is, history stops accumulating
+- **Minimal dbt** — strip your dbt project down to just the `snapshots/` folder and a cron job
+- **Upstream CDC** — move change tracking to your ETL tool (Fivetran, Airbyte history mode) so snapshots become unnecessary
 
 ### Metabase connection
 
@@ -248,7 +281,7 @@ dbt-to-metabase remap --config config.yaml
 ┌─────────────────────────────────────────────────────────┐
 │                  ManifestParser                          │
 │  Read manifest.json → DbtProject with compiled SQL       │
-│  (models, sources, seeds, dependencies, metadata)       │
+│  (models, sources, seeds, snapshots, dependencies)      │
 └─────────────────────┬───────────────────────────────────┘
                       │
                       ▼
@@ -306,6 +339,7 @@ dbt:
 - `git` must be available if cloning from GitHub
 - Database credentials are needed for `dbt compile`
 - Checkpoint columns must be declared explicitly in config (no longer auto-detected)
+- **`dbt snapshot` must continue running** if your project uses dbt snapshots — they are not migrated to Metabase transforms
 
 **What you can remove:**
 - No more `sql_rewriter` warnings about unsupported Jinja
