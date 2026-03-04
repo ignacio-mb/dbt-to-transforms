@@ -1,266 +1,330 @@
 # dbt-to-metabase
-> [!WARNING]
-> **Do not use this in production without extensive testing.**
-> **Back up your Metabase application database before using this tool.**
 
-Migrate dbt models into **Metabase Transforms** — a new Metabase feature that lets you write query results back to your database and reuse them as data sources.
+Migrate [dbt](https://www.getdbt.com/) models into [Metabase Transforms](https://www.metabase.com/docs/latest/data-studio/transforms) automatically.
 
-This tool reads your dbt project from GitHub, rewrites the Jinja-templated SQL into plain SQL, resolves the dependency graph, and creates Metabase transforms (with tags and scheduled jobs) via the Metabase API.
+This tool reads your dbt project, compiles it with `dbt compile`, and creates Metabase transforms from the compiled SQL — complete with dependency ordering, schema mapping, tagging, and job scheduling.
 
-## Features
+## How it works
 
-- **GitHub-native** — reads your dbt project directly from a GitHub repository (no local clone needed; supports monorepos)
-- **Full dependency resolution** — topologically sorts models so transforms are created in the correct order, and Metabase's built-in dependency tracking takes over at runtime
-- **SQL rewriting** — converts `{{ ref() }}`, `{{ source() }}`, `{{ var() }}`, `{{ config() }}`, and `{% if is_incremental() %}` blocks into Metabase-compatible plain SQL
-- **Seed resolution** — discovers dbt seeds from your `seeds/` directory so `ref('my_seed')` resolves correctly without creating unnecessary transforms
-- **Graceful macro fallback** — unsupported Jinja expressions (custom macros, `dbt_utils`) are replaced with `NULL` to keep SQL valid; when that produces structurally broken SQL, the tool falls back to a passthrough `SELECT * FROM schema.table` that reads from the table dbt already created
-- **Incremental support** — maps dbt `incremental` materialization to Metabase's incremental transforms via the `PUT ee/transform/{id}` API with `source-incremental-strategy`
-- **Folder structure preservation** — mirrors your dbt `models/` directory hierarchy as Metabase folders
-- **Schema mapping** — configurable rules to route dbt model folders to specific Metabase target schemas
-- **Tag and job creation** — maps dbt tags to Metabase transform tags and creates scheduled jobs
-- **Remote sync integration** — triggers Metabase's remote sync to serialize transforms to git
-- **Dry-run and plan export** — preview the full migration plan as JSON before executing
-- **Conflict handling** — configurable behavior (skip / replace / error) when transforms already exist
+```
+dbt project ──► dbt compile ──► manifest.json ──► schema remapping ──► Metabase Transforms API
+```
+
+The tool leverages **dbt's own compiler** to resolve all Jinja templating (`ref()`, `source()`, `var()`, macros, conditionals, packages like `dbt_utils`, etc.) into plain SQL. This means every dbt feature works out of the box — no need for regex-based rewriting or manual macro translation.
+
+## Requirements
+
+- **Python** >= 3.9
+- **dbt-core** >= 1.4 (with your database adapter, e.g. `dbt-postgres`)
+- **git** (if cloning from GitHub)
+- **Metabase** with Transforms support (Metabase 50+)
+
+A **live database connection** is required for `dbt compile` to resolve introspective queries. You can provide credentials inline in the config or point to an existing `profiles.yml`.
 
 ## Installation
+
 ```bash
 pip install .
-# or for development:
+```
+
+For development:
+
+```bash
 pip install -e ".[dev]"
 ```
 
-## Quick start
+After makinkg changes to the source code, run:
+
 ```bash
-# 1. Copy and edit the config
+pip install --force-reinstall --no-deps .
+```
+
+## Quick start
+
+1. Copy the example config:
+
+```bash
 cp config.example.yaml config.yaml
-# Edit config.yaml with your GitHub repo, Metabase URL, credentials, etc.
+```
 
-# 2. Validate everything connects
-dbt-to-metabase validate --config config.yaml
+2. Edit `config.yaml` with your dbt project source, database credentials, and Metabase connection.
 
-# 3. Preview the migration plan
-dbt-to-metabase plan --config config.yaml --output plan.json
+3. Dry run to preview the migration plan:
 
-# 4. Run the migration
-dbt-to-metabase migrate --config config.yaml
+```bash
+dbt-to-metabase plan --config config.yaml --stdout
+```
 
-# 4.1 Run the migraiton and validate the data after migration
-dbt-to-metabase migrate --config config.yaml --validate
+4. Execute the migration:
 
-# 5. Remap content to use transforms tables instead
-dbt-to-metabase remap --config config.yaml
-
-# Or do a dry run first:
-dbt-to-metabase migrate --config config.yaml --dry-run --output plan.json
-
-
-# optional: after making a change to a file, run
-pip install . --force-reinstall --no-deps
+```bash
 dbt-to-metabase migrate --config config.yaml
 ```
 
 ## Configuration
 
-See [`config.example.yaml`](config.example.yaml) for the full annotated configuration. Key sections:
+The config file has three main sections: **dbt project source**, **Metabase connection**, and **migration settings**.
 
-### GitHub connection
+### dbt project source
+
+Three input modes are supported:
+
+#### A) Local dbt project
+
 ```yaml
-github:
-  repo: "your-org/your-dbt-repo"
-  branch: "main"
-  subdirectory: "dbt"  # for monorepos
-  # token via env var GITHUB_TOKEN
+dbt:
+  project_path: "/path/to/your/dbt/project"
+  target: "prod"
+  profiles_dir: "~/.dbt"          # OR provide inline credentials below
 ```
 
+#### B) GitHub repository (cloned automatically)
+
+```yaml
+dbt:
+  github_repo: "your-org/your-dbt-repo"
+  github_branch: "main"
+  # github_token: "ghp_..."       # Or set GITHUB_TOKEN env var
+  # github_subdirectory: ""        # For monorepos
+  target: "prod"
+  db_type: "postgres"
+  db_host: "localhost"
+  db_port: 5432
+  db_user: "analytics"
+  db_name: "warehouse"
+  db_schema: "public"
+```
+
+#### C) Pre-built manifest (skip compilation)
+
+If you already run `dbt compile` in CI/CD, pass the manifest directly:
+
+```yaml
+dbt:
+  manifest_path: "/path/to/target/manifest.json"
+```
+
+Or via CLI:
+
+```bash
+dbt-to-metabase migrate --config config.yaml --manifest-path ./target/manifest.json
+```
+
+### Database credentials
+
+`dbt compile` requires a live database connection. You can provide credentials in two ways:
+
+**Inline credentials** (generates `profiles.yml` automatically):
+
+```yaml
+dbt:
+  db_type: "postgres"
+  db_host: "localhost"
+  db_port: 5432
+  db_user: "analytics"
+  # db_password: ""              # Or set DBT_DB_PASSWORD env var
+  db_name: "warehouse"
+  db_schema: "public"
+```
+
+**Existing profiles.yml**:
+
+```yaml
+dbt:
+  profiles_dir: "~/.dbt"
+  target: "prod"
+```
+
+### Schema remapping
+
+dbt's compiled SQL contains literal schema references (e.g. `staging.stg_orders`). To avoid Metabase transforms overwriting your original dbt tables, you remap schemas to a `transforms_*` namespace:
+
+```yaml
+transform_schema_prefix: "transforms_"
+
+schema_remap:
+  staging: transforms_staging
+  intermediate: transforms_intermediate
+  marts: transforms_marts
+  analytics: transforms_analytics
+```
+
+This rewrites `SELECT * FROM staging.stg_orders` to `SELECT * FROM transforms_staging.stg_orders` in the generated transform queries.
+
+### Checkpoint columns (incremental transforms)
+
+Metabase [incremental query transforms](https://www.metabase.com/docs/latest/data-studio/transforms/query-transforms#incremental-query-transforms) use a **checkpoint column** to track which rows have already been processed. On each run, Metabase only processes rows where the checkpoint column value is greater than the last-seen value — similar to dbt's incremental materialization.
+
+Since `dbt compile` evaluates `is_incremental()` as `False` (the model doesn't exist yet at compile time), the incremental block is compiled away and the checkpoint column cannot be auto-detected. You must declare these mappings explicitly:
+
+```yaml
+checkpoint_columns:
+  - model: "fct_orders"
+    column: "updated_at"
+  - model: "fct_events"
+    column: "event_timestamp"
+```
+
+**How it works:** Transforms are initially created as non-incremental and run once to bootstrap the target table. After the first successful run, the tool upgrades them to incremental with the specified checkpoint column. Subsequent runs will only process new/changed rows.
+
 ### Metabase connection
+
 ```yaml
 metabase:
   url: "https://metabase.example.com"
+  api_key: "mb_..."                # Or set METABASE_API_KEY env var
+  # username: "admin@example.com"  # Or set METABASE_USERNAME env var
+  # password: "..."                # Or set METABASE_PASSWORD env var
   database_id: 1
   default_schema: "analytics"
-  # api_key via env var METABASE_API_KEY
 ```
 
-### Schema mappings
+### Full config reference
 
-Route dbt folders to Metabase schemas. A `transform_schema_prefix` (default: `"transforms_"`) is automatically prepended to keep transform tables separate from the original dbt-produced tables:
+See [`config.example.yaml`](config.example.yaml) for a complete annotated configuration file.
 
-```yaml
-transform_schema_prefix: "transforms_"   # default; set to "" to disable
+## Commands
 
-schema_mappings:
-  - dbt_folder_pattern: "staging/*"
-    metabase_schema: "staging"       # → transforms_staging
-  - dbt_folder_pattern: "marts/finance"
-    metabase_schema: "marts_finance" # → transforms_marts_finance
-```
+### `migrate`
 
-With the default prefix, the resulting Postgres schemas are:
+Run the full migration pipeline:
 
-| dbt schema | Transform schema |
-|---|---|
-| `staging` | `transforms_staging` |
-| `intermediate` | `transforms_intermediate` |
-| `marts` | `transforms_marts` |
-
-> **Seeds are not prefixed.** Seeds are pre-existing raw tables (created by `dbt seed`) and are never recreated as transforms. When a transform SQL references a seed via `ref('my_seed')`, it resolves to the seed's original schema (e.g. `raw.payment_methods`), not `transforms_raw.payment_methods`. This ensures transforms can read from seed data without requiring a copy.
-
-### Tag mappings and jobs
-```yaml
-tag_mappings:
-  - dbt_tag: "nightly"
-    metabase_tag: "daily"
-
-default_tags: ["daily"]
-
-jobs:
-  - name: "Nightly transforms"
-    schedule: "0 0 * * *"
-    tags: ["daily"]
-```
-
-### Model filters
-```yaml
-include_models: ["stg_*", "fct_*", "dim_*"]
-exclude_models: ["*_tmp", "*_deprecated"]
-```
-
-## How it works
-```
-┌─────────────┐    ┌──────────────┐    ┌────────────────┐    ┌──────────────┐
-│   GitHub     │    │  dbt Parser  │    │  SQL Rewriter  │    │  Metabase    │
-│  dbt repo    │───▶│  + Resolver  │───▶│  (Jinja→SQL)   │───▶│  API Client  │
-└─────────────┘    └──────────────┘    └────────────────┘    └──────────────┘
-                          │                                          │
-                   ┌──────┴──────┐                          ┌───────┴───────┐
-                   │ Dependency  │                          │ Creates:      │
-                   │ DAG / topo  │                          │ - Transforms  │
-                   │ sort        │                          │ - Tags        │
-                   └─────────────┘                          │ - Jobs        │
-                                                            │ - Folders     │
-                                                            └───────────────┘
-```
-
-### SQL rewriting rules
-
-| dbt construct | Metabase output |
-|---|---|
-| `{{ ref('stg_orders') }}` | `analytics.stg_orders` (schema resolved from config) |
-| `{{ ref('payment_methods') }}` (seed) | `raw.payment_methods` (schema resolved from seed config) |
-| `{{ source('raw', 'orders') }}` | `raw_data.orders` (schema from sources.yml) |
-| `{{ config(...) }}` | Stripped entirely |
-| `{{ var('name') }}` | Literal value from `dbt_project.yml` vars |
-| `{# comment #}` | Stripped |
-| `{% if is_incremental() %} WHERE col > ... {% endif %}` | `[[WHERE col > {{checkpoint}}::timestamp]]` |
-| `{{ custom_macro(...) }}` | Replaced with `NULL`; falls back to passthrough if SQL breaks |
-| `{{ dbt_utils.date_spine(...) }}` | Falls back to `SELECT * FROM schema.model` (untranslatable) |
-
-### Materialization mapping
-
-| dbt materialization | Metabase behavior |
-|---|---|
-| `table` | Standard transform (DROP + CREATE on each run) |
-| `view` | Converted to table transform (with warning) |
-| `incremental` | Incremental transform via `source-incremental-strategy` API |
-| `ephemeral` | Materialized as a table transform (with warning). In dbt these are inlined CTEs, but Metabase requires physical tables so they are persisted. |
-| `seed` | **Not a transform.** Seeds are pre-existing raw tables; they are registered so `ref('seed_name')` resolves to the seed's original schema (e.g. `raw.seed_name`), but no transform is created. |
-
-## Remote sync
-
-When `remote_sync.enabled: true`, the tool triggers Metabase's serialization export after migration. This pushes transform definitions as YAML files to your configured GitHub repo, enabling:
-
-- Version-controlled transform definitions
-- Code review workflows for transform changes
-- Environment promotion (dev → staging → prod)
-
-To set up remote sync in Metabase: Admin Settings → General → Remote Sync → toggle "Transforms" on.
-
-## CLI reference
-```
-dbt-to-metabase migrate  -c config.yaml [--dry-run] [-o plan.json]
-dbt-to-metabase plan     -c config.yaml [-o plan.json] [--stdout]
-dbt-to-metabase validate -c config.yaml
-```
-
----
-
-## dbt Cloud Runner vs. Metabase Jobs & Runs: A Comparison
-
-When migrating from dbt to Metabase Transforms, it's worth understanding how the scheduling and execution models compare.
-
-### Scheduling model
-
-| Aspect | dbt Cloud | Metabase Transforms |
-|---|---|---|
-| **Scheduler** | dbt Cloud Jobs with cron or interval schedules | Metabase Jobs with cron schedules |
-| **Grouping** | Jobs run a set of dbt commands (e.g. `dbt run --select tag:nightly`) | Jobs run all transforms that match one or more **tags** |
-| **Granularity** | Can run individual models, selectors, tags, or full project | Tag-based: all transforms with a given tag run together |
-| **Model selection** | Rich selector syntax: `dbt run --select stg_orders+`, `tag:nightly`, `path:marts/` | Tags only. No graph selectors — but Metabase auto-resolves dependencies |
-
-### Dependency handling
-
-| Aspect | dbt Cloud | Metabase Transforms |
-|---|---|---|
-| **DAG awareness** | Full. dbt resolves the DAG and runs models in order within a job | Full. Metabase tracks transform dependencies and runs them in order |
-| **Cross-job deps** | Manual. You chain jobs using "Run after" triggers or API orchestration | **Automatic**. If Transform B depends on A, any job that runs B will also run A — even if A isn't tagged for that job |
-| **Failure handling** | Configurable: fail-fast or continue. Downstream models skip on upstream failure | Run-level: a failed transform stops dependent transforms in the same job run |
-
-### Execution environment
-
-| Aspect | dbt Cloud | Metabase Transforms |
-|---|---|---|
-| **SQL execution** | dbt compiles Jinja → SQL, sends to warehouse | Metabase sends plain SQL to warehouse (no Jinja compilation) |
-| **Python support** | dbt Python models (via dbt-snowflake, dbt-bigquery, etc.) | Metabase Python transforms (dedicated execution environment) |
-| **Compute** | Runs on dbt Cloud infrastructure or self-hosted runners | SQL runs on your database; Python runs in Metabase's environment |
-| **Incremental** | Rich incremental strategies (append, merge, delete+insert, microbatch) | Append-only incremental via checkpoint column |
-
-### Observability
-
-| Aspect | dbt Cloud | Metabase Transforms |
-|---|---|---|
-| **Run history** | Full run history with model-level timing, logs, and artifacts | Run history per transform with status, duration, and error logs |
-| **Lineage** | dbt Docs lineage graph, dbt Explorer | Transform dependency graph (Pro/Enterprise) in Data Studio |
-| **Alerts** | Slack/email notifications on failure, webhooks | Visible in Runs view; alerting depends on Metabase plan |
-| **Freshness** | Source freshness checks (`dbt source freshness`) | No equivalent — freshness is implied by transform run schedule |
-
-### Key differences summary
-
-**dbt Cloud** is purpose-built for data transformation orchestration with sophisticated features like model selectors, incremental strategies (merge, delete+insert), source freshness, and environment management. It's the right tool for complex transformation pipelines.
-
-**Metabase Transforms** are designed to bring lightweight transformation directly into the BI layer. The killer feature is that **transforms are first-class citizens in Metabase** — the output tables are immediately available for questions, dashboards, and other transforms without any external tooling. The dependency auto-resolution across jobs is also more forgiving than dbt Cloud's manual job chaining.
-
-**When to keep dbt Cloud alongside Metabase Transforms**: If you have complex incremental strategies (merge, snapshot), heavy use of dbt macros/packages, or need dbt's testing framework. You can use dbt for the heavy ETL and Metabase Transforms for "last-mile" transformations closer to the BI layer.
-
-**When Metabase Transforms can replace dbt**: If your dbt project is primarily `SELECT`-based transformations (staging, marts) without complex Jinja macros, and you want a simpler operational model where your BI tool owns the full data-to-dashboard pipeline.
-
-## Utilities
-
-### Wiping transforms
-
-To delete all transforms from both Metabase and the database before re-running a migration:
 ```bash
-chmod +x scripts/wipe-transforms.sh
-./scripts/wipe-transforms.sh
+dbt-to-metabase migrate --config config.yaml
 ```
 
-The script removes transforms via the Metabase API, drops the corresponding tables from Postgres (scanning `transforms_staging`, `transforms_intermediate`, `transforms_marts`, `staging`, `intermediate`, and `marts` schemas), and triggers a Metabase database sync. Configure with environment variables:
+Options:
+- `--dry-run` — generate plan without executing
+- `--output plan.json` — export plan to JSON
+- `--validate` — run data validation after transforms complete
+- `--manifest-path PATH` — use a pre-compiled manifest.json
+- `--dbt-project-path PATH` — override dbt project location
+- `--dbt-target NAME` — override dbt target
+
+### `plan`
+
+Generate a migration plan without executing it:
+
 ```bash
-METABASE_URL=http://localhost:3000 \
-DB_HOST=localhost DB_PORT=5433 \
-./scripts/wipe-transforms.sh
+dbt-to-metabase plan --config config.yaml --stdout
 ```
 
-## Limitations
+### `check`
 
-- **Jinja macros**: Custom macros, `dbt_utils` macros, and complex Jinja logic cannot be automatically translated. Unsupported expressions are replaced with `NULL`. If that makes the SQL structurally invalid (e.g. a CTE body that becomes `NULL`), the tool generates a passthrough `SELECT *` from the dbt-created table and logs a warning. These passthrough transforms work correctly but won't reflect future dbt logic changes until manually updated in Metabase.
-- **Incremental strategies**: dbt supports merge, delete+insert, and microbatch. Metabase only supports append-style incremental via `source-incremental-strategy`. Models with `incremental_strategy: merge` need manual review.
-- **Tests**: dbt tests are not migrated. Consider using Metabase's data quality features or keeping dbt tests running separately.
-- **Snapshots**: dbt snapshots (SCD Type 2) have no Metabase equivalent and are excluded.
-- **Seeds**: Seeds are registered for `ref()` resolution but are not created as transforms (they already exist as database tables from `dbt seed`). If your seeds target a custom schema, configure it in `dbt_project.yml` under the `seeds:` key.
-- **Cross-database**: Metabase transforms write to the same database they read from. Cross-database refs won't work.
+Validate configuration and connectivity:
+
+```bash
+dbt-to-metabase check --config config.yaml
+```
+
+This verifies that dbt can compile successfully, dependencies resolve, and Metabase is reachable.
+
+### `validate`
+
+Compare transform output tables against the original dbt tables:
+
+```bash
+dbt-to-metabase validate --config config.yaml
+```
+
+### `remap`
+
+Remap existing Metabase cards/dashboards from dbt tables to transform tables:
+
+```bash
+dbt-to-metabase remap --config config.yaml
+```
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    DbtCompiler                           │
+│  git clone (or local path) → dbt deps → dbt compile     │
+│  Output: target/manifest.json                           │
+└─────────────────────┬───────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────┐
+│                  ManifestParser                          │
+│  Read manifest.json → DbtProject with compiled SQL       │
+│  (models, sources, seeds, dependencies, metadata)       │
+└─────────────────────┬───────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────┐
+│              TransformSqlAdapter                         │
+│  Remap schema references in compiled SQL                 │
+│  staging.orders → transforms_staging.orders              │
+└─────────────────────┬───────────────────────────────────┘
+                      │
+                      ▼
+┌─────────────────────────────────────────────────────────┐
+│                    Migrator                              │
+│  Dependency ordering → Metabase API calls                │
+│  Create transforms, tags, jobs, run in order             │
+└─────────────────────────────────────────────────────────┘
+```
+
+## Environment variables
+
+| Variable | Description |
+|---|---|
+| `GITHUB_TOKEN` | GitHub personal access token for private repos |
+| `DBT_DB_PASSWORD` | Database password for dbt compile |
+| `DBT_DB_USER` | Database user for dbt compile |
+| `DBT_DB_HOST` | Database host for dbt compile |
+| `DBT_DB_NAME` | Database name for dbt compile |
+| `METABASE_API_KEY` | Metabase API key |
+| `METABASE_USERNAME` | Metabase username |
+| `METABASE_PASSWORD` | Metabase password |
+
+## Migrating from v0.1
+
+v0.1 used the `github:` config key and a regex-based SQL rewriter. v0.2 uses `dbt compile` for accurate SQL generation.
+
+**Config changes:**
+
+```yaml
+# v0.1 (still supported with deprecation warning)
+github:
+  repo: "org/repo"
+  branch: "main"
+
+# v0.2 (recommended)
+dbt:
+  github_repo: "org/repo"
+  github_branch: "main"
+  target: "prod"
+  db_host: "localhost"
+  db_user: "analytics"
+  db_name: "warehouse"
+```
+
+**New requirements:**
+- `dbt-core` must be installed (`pip install dbt-postgres` or your adapter)
+- `git` must be available if cloning from GitHub
+- Database credentials are needed for `dbt compile`
+- Checkpoint columns must be declared explicitly in config (no longer auto-detected)
+
+**What you can remove:**
+- No more `sql_rewriter` warnings about unsupported Jinja
+- No more `NULL` replacements for unrecognized macros
+- No more passthrough queries for complex models
+
+## Example project
+
+For a working example, see [dbt-metabase-postgres-example](https://github.com/ignacio-mb/dbt-metabase-postgres-example) which includes a dbt project, Postgres setup, and Docker Compose for local testing.
 
 ## Development
+
 ```bash
+# Install dev dependencies
 pip install -e ".[dev]"
+
+# Run tests
 pytest tests/ -v
+
+# Lint
+ruff check .
 ```

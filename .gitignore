@@ -23,8 +23,11 @@ dbt_packages/
 logs/
 
 # Migration output
-plan.json
+migration_plan.json
 
 # macOS
 .DS_Store
 __MACOSX/
+
+.claude/
+settings.local.json

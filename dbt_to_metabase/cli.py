@@ -22,9 +22,27 @@ def setup_logging(verbose=False):
     logging.getLogger("requests").setLevel(logging.WARNING)
 
 
+def _apply_cli_overrides(config, args):
+    # type: (MigrationConfig, argparse.Namespace) -> None
+    """Apply CLI flag overrides to the loaded config."""
+    if getattr(args, "manifest_path", None):
+        config.dbt.manifest_path = args.manifest_path
+        # Clear other source options — manifest takes precedence
+        config.dbt.project_path = None
+        config.dbt.github_repo = None
+    if getattr(args, "dbt_project_path", None):
+        config.dbt.project_path = args.dbt_project_path
+        # Clear github — local path takes precedence
+        config.dbt.github_repo = None
+    if getattr(args, "dbt_target", None):
+        config.dbt.target = args.dbt_target
+
+
 def cmd_migrate(args):
     # type: (argparse.Namespace) -> int
     config = MigrationConfig.from_yaml(args.config)
+    _apply_cli_overrides(config, args)
+
     if args.dry_run:
         config.dry_run = True
 
@@ -54,16 +72,15 @@ def cmd_migrate(args):
         for w in plan.warnings:
             print("  !  {}".format(w))
 
-    # Print validation summary if enabled
     if args.validate and migrator.validation_report:
         report = migrator.validation_report
         if not report.all_passed:
-            print("\n  ✗ DATA VALIDATION FAILED: {} of {} tables differ".format(
+            print("\n  X DATA VALIDATION FAILED: {} of {} tables differ".format(
                 report.tables_failed, report.total_tables
             ))
-            return 2  # Distinct exit code for validation failure
+            return 2
         else:
-            print("\n  ✓ DATA VALIDATION PASSED: all {} tables match".format(
+            print("\n  OK DATA VALIDATION PASSED: all {} tables match".format(
                 report.tables_passed
             ))
 
@@ -73,6 +90,7 @@ def cmd_migrate(args):
 def cmd_plan(args):
     # type: (argparse.Namespace) -> int
     config = MigrationConfig.from_yaml(args.config)
+    _apply_cli_overrides(config, args)
     config.dry_run = True
 
     migrator = Migrator(config)
@@ -139,6 +157,7 @@ def cmd_validate(args):
     # type: (argparse.Namespace) -> int
     """Standalone validation: check that transform tables match dbt expectations."""
     config = MigrationConfig.from_yaml(args.config)
+    _apply_cli_overrides(config, args)
 
     migrator = Migrator(config)
     try:
@@ -148,13 +167,13 @@ def cmd_validate(args):
         return 1
 
     if not report.all_passed:
-        return 2  # Distinct exit code for validation failure
+        return 2
     return 0
 
 
 def cmd_check(args):
     # type: (argparse.Namespace) -> int
-    """Validate config and connectivity (previously 'validate', now 'check')."""
+    """Validate config and connectivity."""
     try:
         config = MigrationConfig.from_yaml(args.config)
         print("OK Config loaded from {}".format(args.config))
@@ -162,17 +181,21 @@ def cmd_check(args):
         print("FAIL Config error: {}".format(e))
         return 1
 
-    from .dbt_parser import GitHubDbtParser
+    from .dbt_compiler import DbtCompiler, DbtCompilationError
+    from .manifest_parser import ManifestParser
     from .dependency_resolver import CyclicDependencyError, DependencyResolver
 
     try:
-        parser = GitHubDbtParser(config.github)
+        compiler = DbtCompiler(config.dbt)
+        manifest_path = compiler.compile()
+        parser = ManifestParser(manifest_path)
         project = parser.parse()
-        print("OK dbt project '{}' parsed successfully".format(project.name))
+        compiler.cleanup()
+        print("OK dbt project '{}' compiled and parsed successfully".format(project.name))
         print("  Models:  {}".format(len(project.models)))
         print("  Sources: {}".format(len(project.sources)))
-    except Exception as e:
-        print("FAIL dbt parsing error: {}".format(e))
+    except (DbtCompilationError, Exception) as e:
+        print("FAIL dbt compilation/parsing error: {}".format(e))
         return 1
 
     try:
@@ -198,6 +221,23 @@ def cmd_check(args):
     return 0
 
 
+def _add_dbt_source_args(parser):
+    # type: (argparse.ArgumentParser) -> None
+    """Add common dbt source override flags to a subparser."""
+    parser.add_argument(
+        "--manifest-path",
+        help="Path to a pre-compiled manifest.json (skips dbt compile)",
+    )
+    parser.add_argument(
+        "--dbt-project-path",
+        help="Path to local dbt project directory (overrides config)",
+    )
+    parser.add_argument(
+        "--dbt-target",
+        help="dbt target name for compilation (default: from config)",
+    )
+
+
 def main():
     # type: () -> int
     parser = argparse.ArgumentParser(
@@ -220,8 +260,9 @@ def main():
     p_migrate.add_argument("--output", "-o", help="Export plan to JSON file")
     p_migrate.add_argument(
         "--validate", action="store_true",
-        help="Run data validation after transforms complete (compares output against dbt tables)",
+        help="Run data validation after transforms complete",
     )
+    _add_dbt_source_args(p_migrate)
     p_migrate.set_defaults(func=cmd_migrate)
 
     # plan
@@ -229,17 +270,19 @@ def main():
     p_plan.add_argument("--config", "-c", required=True, help="Path to config YAML")
     p_plan.add_argument("--output", "-o", help="Output JSON file")
     p_plan.add_argument("--stdout", action="store_true", help="Print plan to stdout")
+    _add_dbt_source_args(p_plan)
     p_plan.set_defaults(func=cmd_plan)
 
-    # validate (data validation)
+    # validate
     p_validate = subparsers.add_parser(
         "validate",
         help="Validate that transform output tables match dbt expectations",
     )
     p_validate.add_argument("--config", "-c", required=True, help="Path to config YAML")
+    _add_dbt_source_args(p_validate)
     p_validate.set_defaults(func=cmd_validate)
 
-    # check (config/connectivity check — was previously 'validate')
+    # check
     p_check = subparsers.add_parser("check", help="Validate config and connectivity")
     p_check.add_argument("--config", "-c", required=True, help="Path to config YAML")
     p_check.set_defaults(func=cmd_check)

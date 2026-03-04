@@ -1,48 +1,132 @@
 # dbt-to-metabase migration configuration
 # Copy this to config.yaml and fill in your values.
 
-github:
-  repo: "your-org/your-dbt-repo"       # GitHub repo (org/repo format)
-  branch: "main"                        # Branch to read dbt models from
-  # token: "ghp_..."                    # Or set GITHUB_TOKEN env var
-  subdirectory: ""                      # For monorepos: path to dbt project root
+# ──────────────────────────────────────────────
+# dbt project source
+#
+# Three input modes (pick one):
+#   A) project_path  — local dbt project directory
+#   B) github_repo   — cloned automatically
+#   C) manifest_path — skip compilation, use a pre-built manifest.json
+# ──────────────────────────────────────────────
+dbt:
+  # Option A: local dbt project
+  # project_path: "/path/to/your/dbt/project"
+
+  # Option B: GitHub repo (cloned to a temp directory)
+  github_repo: "your-org/your-dbt-repo"
+  github_branch: "main"
+  # github_token: "ghp_..."                  # Or set GITHUB_TOKEN env var
+  # github_subdirectory: "dbt_project"       # For monorepos with dbt in a subfolder
+
+  # Option C: pre-built manifest (skips clone + compile)
+  # manifest_path: "/path/to/target/manifest.json"
+
+  # ── dbt compile settings ──
+  target: "prod"
+
+  # Point to an existing profiles.yml directory...
+  # profiles_dir: "~/.dbt"
+
+  # ...OR provide inline database credentials (generates profiles.yml):
+  db_type: "postgres"
+  db_host: "localhost"
+  db_port: 5432
+  db_user: "analytics"
+  # db_password: ""                          # Or set DBT_DB_PASSWORD env var
+  db_name: "warehouse"
+  db_schema: "public"
+  db_threads: 4
 
 metabase:
-  url: "https://metabase.example.com"   # Metabase instance URL
-  # api_key: "mb_..."                   # Or set METABASE_API_KEY env var
-  # username: "admin@example.com"       # Or set METABASE_USERNAME env var
-  # password: "..."                     # Or set METABASE_PASSWORD env var
-  database_id: 1                        # Target database ID in Metabase
-  default_schema: "analytics"           # Default schema for transform output tables
+  url: "localhost:3000"        # Metabase instance URL
+  # api_key: "mb_..."                        # Or set METABASE_API_KEY env var
+  # username: "admin@example.com"            # Or set METABASE_USERNAME env var
+  # password: "..."                          # Or set METABASE_PASSWORD env var
+  database_id: 1                             # Target database ID in Metabase
+
+  # Default Postgres schema for models that don't match any schema_mappings
+  # entry.  This is a SCHEMA name (e.g. "public"), NOT your database name.
+  # The transform_schema_prefix is prepended, so "public" becomes
+  # "transforms_public".
+  default_schema: "public"
 
 remote_sync:
-  enabled: false                        # Set true to push transforms to git after migration
+  enabled: false
   # github_repo: "your-org/metabase-config"
   # branch: "main"
 
 # ──────────────────────────────────────────────
-# Schema mappings
-# Map dbt folder paths → Metabase target schemas.
-# The transform_schema_prefix (default: "transforms_") is automatically
-# prepended, so "staging" becomes "transforms_staging" in Metabase.
-# This keeps transforms separate from the original dbt-produced tables.
+# Schema remapping (SQL rewriting)
+#
+# Rewrites schema references inside the compiled SQL so that
+# transforms read from other transforms instead of the original
+# dbt tables.
+#
+# IMPORTANT: Only list actual Postgres SCHEMA names here, never
+# your database name.  dbt compiles three-part references like
+# "my_database"."staging"."orders" — you only want to remap the
+# middle part (the schema).
+#
+# Example: dbt compiles  SELECT * FROM "warehouse"."staging"."orders"
+#          with the mapping below it becomes
+#          SELECT * FROM "warehouse"."transforms_staging"."orders"
 # ──────────────────────────────────────────────
 transform_schema_prefix: "transforms_"
 
+schema_remap:
+  staging: transforms_staging
+  intermediate: transforms_intermediate
+  marts: transforms_marts
+
+# ──────────────────────────────────────────────
+# Schema mappings (folder-based)
+#
+# Controls which Postgres schema each transform's OUTPUT TABLE
+# is created in.  Maps dbt folder names to Metabase target schemas.
+# The transform_schema_prefix is prepended automatically.
+#
+# Use EXACT folder names as they appear in the manifest, e.g.
+# "staging", "marts", "intermediate".  Do NOT use globs like
+# "staging/*" — the manifest reports folders without trailing
+# slashes or wildcards.
+#
+# To check your folder names, run:
+#   dbt-to-metabase plan --config config.yaml --stdout | grep '"folder"'
+# ──────────────────────────────────────────────
 schema_mappings:
-  - dbt_folder_pattern: "staging/*"
+  - dbt_folder_pattern: "staging"
     metabase_schema: "staging"
-  - dbt_folder_pattern: "intermediate/*"
+  - dbt_folder_pattern: "intermediate"
     metabase_schema: "intermediate"
-  - dbt_folder_pattern: "marts/*"
+  - dbt_folder_pattern: "marts"
     metabase_schema: "marts"
-  - dbt_folder_pattern: "marts/finance"
-    metabase_schema: "marts_finance"
+  # Subfolders still work — use the full path:
+  # - dbt_folder_pattern: "marts/finance"
+  #   metabase_schema: "marts_finance"
+
+# ──────────────────────────────────────────────
+# Checkpoint columns (for incremental transforms)
+#
+# Metabase incremental query transforms use a checkpoint column
+# to track which rows have been processed.  On each run, Metabase
+# only processes rows where the checkpoint column value is greater
+# than the last-seen value.
+#
+# Because dbt compile evaluates is_incremental() as False, the
+# incremental block is compiled away and the checkpoint column
+# cannot be auto-detected.  Declare them here explicitly.
+#
+# See: https://www.metabase.com/docs/latest/data-studio/transforms/query-transforms#incremental-query-transforms
+# ──────────────────────────────────────────────
+checkpoint_columns: []
+  # - model: "fct_orders"
+  #   column: "updated_at"
+  # - model: "fct_events"
+  #   column: "event_timestamp"
 
 # ──────────────────────────────────────────────
 # Tag mappings
-# Map dbt tags → Metabase transform tags
-# Unmapped dbt tags are passed through as-is.
 # ──────────────────────────────────────────────
 tag_mappings:
   - dbt_tag: "nightly"
@@ -50,54 +134,27 @@ tag_mappings:
   - dbt_tag: "hourly_refresh"
     metabase_tag: "hourly"
 
-# Default tags applied to models with no tags
 default_tags:
   - "daily"
 
 # ──────────────────────────────────────────────
 # Jobs
-# Metabase transform jobs to create
 # ──────────────────────────────────────────────
 jobs:
   - name: "Nightly dbt transforms"
-    schedule: "0 0 * * *"              # Midnight every day (cron)
+    schedule: "0 0 * * *"
     tags: ["daily"]
   - name: "Hourly refresh"
-    schedule: "0 * * * *"              # Top of every hour
+    schedule: "0 * * * *"
     tags: ["hourly"]
-  - name: "Weekly aggregations"
-    schedule: "0 2 * * 1"              # Monday at 2 AM
-    tags: ["weekly"]
 
 # ──────────────────────────────────────────────
 # Migration settings
 # ──────────────────────────────────────────────
-
-# Prefix for Metabase folder hierarchy (e.g. "dbt/staging/orders")
 folder_prefix: "dbt"
-
-# Preserve dbt folder structure as Metabase folders
 preserve_folder_structure: true
-
-# Dry run: generate plan without executing
 dry_run: false
-
-# How to handle existing transforms with the same name:
-# "skip" — leave existing, don't overwrite
-# "replace" — delete existing and recreate
-# "error" — fail if any exist
-on_conflict: "skip"
-
-# ──────────────────────────────────────────────
-# Remap schema map (optional)
-# Maps dbt schemas → transform schemas for the `remap` command.
-# Auto-derived from schema_mappings + transform_schema_prefix if omitted.
-# Only set this if you need custom overrides.
-# ──────────────────────────────────────────────
-# remap_schema_map:
-#   staging: transforms_staging
-#   intermediate: transforms_intermediate
-#   marts: transforms_marts
+on_conflict: "skip"                          # "skip", "replace", or "error"
 
 # Model filters (glob patterns)
 # include_models: ["stg_*", "fct_*", "dim_*"]
