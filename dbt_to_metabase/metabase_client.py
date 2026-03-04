@@ -124,13 +124,11 @@ class MetabaseClient:
             },
         }  # type: Dict[str, Any]
 
-        if is_incremental and checkpoint_column:
-            # Embed the strategy inside the source object, not at payload root.
-            # Key is "source-incremental-strategy", inner type is "checkpoint".
-            source["source-incremental-strategy"] = {
-                "type": "checkpoint",
-                "checkpoint-filter": checkpoint_column,
-            }
+        # NOTE: We do NOT set source-incremental-strategy at creation time.
+        # The Metabase API requires column-unique-key references that are
+        # only available after the output table is created and synced.
+        # Incremental checkpoint columns must be set in the Metabase UI
+        # after the first run completes.
 
         payload = {
             "name": name,
@@ -188,16 +186,23 @@ class MetabaseClient:
         This is used after bootstrapping: create without incremental strategy,
         run once to create the target table, then upgrade to incremental so
         future runs use the checkpoint filter.
+
+        We must send the full source object back — a partial PUT with only
+        source-incremental-strategy fails because Metabase re-validates the
+        entire source and needs the type + query fields present.
         """
-        payload = {
-            "source": {
-                "source-incremental-strategy": {
-                    "type": "checkpoint",
-                    "checkpoint-filter": checkpoint_column,
-                },
-            },
+        existing = self.get_transform(transform_id)
+        source = existing.get("source", {})
+
+        # Merge the incremental strategy into the existing source
+        source["source-incremental-strategy"] = {
+            "type": "checkpoint",
+            "checkpoint-filter": checkpoint_column,
         }
-        result = self._put("transform/{}".format(transform_id), json=payload)
+
+        result = self._put("transform/{}".format(transform_id), json={
+            "source": source,
+        })
         logger.info(
             "Upgraded transform id=%d to incremental (checkpoint=%s)",
             transform_id, checkpoint_column,

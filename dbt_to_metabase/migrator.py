@@ -15,9 +15,11 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from .config import MigrationConfig
-from .dbt_parser import GitHubDbtParser
+from .dbt_compiler import DbtCompiler, DbtCompilationError
+from .manifest_parser import ManifestParser
 from .dependency_resolver import CyclicDependencyError, DependencyResolver
 from .metabase_client import MetabaseApiError, MetabaseClient
+from .transform_sql_adapter import TransformSqlAdapter
 from .models import (
     DbtMaterialization,
     DbtModel,
@@ -27,7 +29,6 @@ from .models import (
     MetabaseTransform,
     MigrationPlan,
 )
-from .sql_rewriter import SqlRewriter
 from .data_validator import DataValidator, ValidationReport
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ class Migrator:
     def __init__(self, config, enable_validation=False):
         # type: (MigrationConfig, bool) -> None
         self.config = config
-        self.parser = GitHubDbtParser(config.github)
+        self.compiler = DbtCompiler(config.dbt)
         self.client = MetabaseClient(config.metabase)
         self.project = None  # type: Optional[DbtProject]
         self.plan = None  # type: Optional[MigrationPlan]
@@ -50,63 +51,76 @@ class Migrator:
         self.validator = None  # type: Optional[DataValidator]
         self.validation_report = None  # type: Optional[ValidationReport]
 
+        # Build checkpoint column lookup from config
+        self._checkpoint_columns = {
+            c.model: c.column for c in config.checkpoint_columns
+        }  # type: Dict[str, str]
+
     def run(self):
         # type: () -> MigrationPlan
         logger.info("=" * 60)
         logger.info("dbt -> Metabase Transforms Migration")
         logger.info("=" * 60)
 
-        logger.info("Step 1/6: Parsing dbt project from GitHub...")
-        self.project = self.parser.parse()
-
-        logger.info("Step 2/6: Resolving model dependencies...")
-        resolver = DependencyResolver(self.project)
         try:
-            execution_order = resolver.resolve(exclude_seeds_only=True)
-        except CyclicDependencyError as e:
-            raise MigrationError("Cannot migrate: {}".format(e))
+            logger.info("Step 1/6: Compiling dbt project...")
+            manifest_path = self.compiler.compile()
 
-        layers = resolver.get_execution_layers()
-        self.execution_layers = layers
-        logger.info(
-            "Execution plan: %d models in %d layers",
-            len(execution_order), len(layers),
-        )
+            logger.info("Step 2/6: Parsing compiled manifest...")
+            parser = ManifestParser(manifest_path)
+            self.project = parser.parse()
 
-        logger.info("Step 3/6: Building migration plan...")
-        self.plan = self._build_plan(execution_order)
-        self._log_plan_summary()
+            logger.info("Step 3/6: Resolving model dependencies...")
+            resolver = DependencyResolver(self.project)
+            try:
+                execution_order = resolver.resolve(exclude_seeds_only=True)
+            except CyclicDependencyError as e:
+                raise MigrationError("Cannot migrate: {}".format(e))
 
-        if self.config.dry_run:
-            logger.info("DRY RUN -- skipping execution. Plan saved.")
+            layers = resolver.get_execution_layers()
+            self.execution_layers = layers
+            logger.info(
+                "Execution plan: %d models in %d layers",
+                len(execution_order), len(layers),
+            )
+
+            logger.info("Step 4/6: Building migration plan...")
+            self.plan = self._build_plan(execution_order)
+            self._log_plan_summary()
+
+            if self.config.dry_run:
+                logger.info("DRY RUN -- skipping execution. Plan saved.")
+                return self.plan
+
+            logger.info("Step 5/6: Executing migration plan...")
+            self._execute_plan()
+
+            # Pre-transform snapshot: capture dbt table state for comparison
+            if self.enable_validation:
+                logger.info("Step 5.5/6: Snapshotting dbt tables for validation...")
+                self._snapshot_for_validation()
+
+            logger.info("Step 5/6 (cont): Running transforms in dependency order...")
+            self._run_transforms()
+
+            # Post-transform validation
+            if self.enable_validation:
+                logger.info("Step 5.5/6 (cont): Validating transforms against dbt data...")
+                self.validation_report = self._validate_transforms()
+
+            if self.config.remote_sync.enabled:
+                logger.info("Step 6/6: Triggering Metabase remote sync...")
+                self._trigger_remote_sync()
+            else:
+                logger.info("Step 6/6: Remote sync not enabled, skipping.")
+
+            logger.info("=" * 60)
+            logger.info("Migration complete!")
+            logger.info("=" * 60)
             return self.plan
 
-        logger.info("Step 4/6: Executing migration plan...")
-        self._execute_plan()
-
-        # Pre-transform snapshot: capture dbt table state for comparison
-        if self.enable_validation:
-            logger.info("Step 4.5/6: Snapshotting dbt tables for validation...")
-            self._snapshot_for_validation()
-
-        logger.info("Step 5/6: Running transforms in dependency order...")
-        self._run_transforms()
-
-        # Post-transform validation: compare transform tables against dbt tables
-        if self.enable_validation:
-            logger.info("Step 5.5/6: Validating transforms against dbt data...")
-            self.validation_report = self._validate_transforms()
-
-        if self.config.remote_sync.enabled:
-            logger.info("Step 6/6: Triggering Metabase remote sync...")
-            self._trigger_remote_sync()
-        else:
-            logger.info("Step 6/6: Remote sync not enabled, skipping.")
-
-        logger.info("=" * 60)
-        logger.info("Migration complete!")
-        logger.info("=" * 60)
-        return self.plan
+        finally:
+            self.compiler.cleanup()
 
     def _build_plan(self, execution_order):
         # type: (List[str]) -> MigrationPlan
@@ -115,6 +129,22 @@ class Migrator:
         plan = MigrationPlan(execution_order=execution_order)
         model_lookup = {m.name: m for m in self.project.models.values()}
 
+        # Build schema_remap from config
+        schema_remap = dict(self.config.schema_remap)
+
+        # Also auto-derive from schema_mappings if schema_remap is empty
+        if not schema_remap and self.config.schema_mappings:
+            prefix = self.config.transform_schema_prefix
+            for mapping in self.config.schema_mappings:
+                schema_remap[mapping.metabase_schema] = "{}{}".format(
+                    prefix, mapping.metabase_schema
+                )
+            # Add the default schema too
+            default = self.config.metabase.default_schema
+            if default and default not in schema_remap:
+                schema_remap[default] = "{}{}".format(prefix, default)
+
+        # Schema overrides for folder-based resolution (used for target schema of transforms)
         schema_overrides = {}  # type: Dict[str, str]
         prefix = self.config.transform_schema_prefix
         for mapping in self.config.schema_mappings:
@@ -122,16 +152,14 @@ class Migrator:
                 prefix, mapping.metabase_schema
             )
 
-        # Default schema also gets the prefix so unmatched models land in
-        # transforms_<default> rather than overwriting the dbt schema.
         transform_default_schema = "{}{}".format(
             prefix, self.config.metabase.default_schema
         )
 
-        rewriter = SqlRewriter(
+        adapter = TransformSqlAdapter(
             self.project,
+            schema_remap=schema_remap,
             default_schema=transform_default_schema,
-            schema_overrides=schema_overrides,
             transform_schema_prefix=prefix,
         )
 
@@ -140,7 +168,9 @@ class Migrator:
         for model_name in execution_order:
             model = model_lookup.get(model_name)
             if not model:
-                plan.warnings.append("Model '{}' in execution order but not found".format(model_name))
+                plan.warnings.append(
+                    "Model '{}' in execution order but not found".format(model_name)
+                )
                 continue
 
             if not self._should_include_model(model):
@@ -156,10 +186,7 @@ class Migrator:
                 )
                 continue
 
-            # ---------------------------------------------------------------
-            # Materialization handling: all materializations become transforms.
-            # Log informational warnings for non-table materializations.
-            # ---------------------------------------------------------------
+            # Log informational warnings for non-table materializations
             if model.materialization == DbtMaterialization.VIEW:
                 plan.warnings.append(
                     "Model '{}' is a VIEW in dbt. "
@@ -171,7 +198,7 @@ class Migrator:
                     "Metabase transforms create tables. Materializing as table.".format(model.name)
                 )
 
-            rewritten_sql, warnings = rewriter.rewrite(model)
+            adapted_sql, warnings = adapter.adapt(model)
             plan.warnings.extend(
                 "[{}] {}".format(model.name, w) for w in warnings
             )
@@ -181,14 +208,15 @@ class Migrator:
             tags = self._resolve_tags(model)
             all_tags.update(tags)
 
-            checkpoint_col = getattr(rewriter, '_last_checkpoint_column', None)
+            # Checkpoint column from config
+            checkpoint_col = self._checkpoint_columns.get(model.name)
 
             transform = MetabaseTransform(
                 name=model.name,
-                query=rewritten_sql,
+                query=adapted_sql,
                 database_id=self.config.metabase.database_id,
                 schema_name=schema,
-                table_name=model.name,
+                table_name=model.alias or model.name,
                 description=self._build_description(model),
                 folder=folder,
                 tags=tags,
@@ -242,11 +270,13 @@ class Migrator:
     def _resolve_schema(self, model, schema_overrides):
         # type: (DbtModel, Dict[str, str]) -> str
         for pattern, schema in schema_overrides.items():
+            # Match exact folder, glob pattern, or the base of a "dir/*" pattern
             if fnmatch.fnmatch(model.folder, pattern) or model.folder == pattern:
                 return schema
+            # "staging/*" should also match folder "staging" (no subfolder)
+            if pattern.endswith("/*") and model.folder == pattern[:-2]:
+                return schema
 
-        # Fallback schemas also get the transform prefix so transforms never
-        # collide with the original dbt-produced tables.
         prefix = self.config.transform_schema_prefix
 
         if model.schema_name and model.schema_name != self.project.target_schema:
@@ -331,7 +361,9 @@ class Migrator:
             folder_id = None
             if transform.folder:
                 try:
-                    folder_id = self.client.create_folder_hierarchy(transform.folder, namespace="transforms")
+                    folder_id = self.client.create_folder_hierarchy(
+                        transform.folder, namespace="transforms"
+                    )
                     logger.info("Folder '%s' -> collection_id=%s", transform.folder, folder_id)
                 except Exception as e:
                     logger.warning("Failed to create folder '%s': %s", transform.folder, e)
@@ -505,30 +537,21 @@ class Migrator:
                     )
                     logger.error("Transform '%s' run failed: %s", name, e)
 
-            # Upgrade incremental transforms after their bootstrap run has
-            # created the target table.  We intentionally created them as
-            # non-incremental so the first run succeeds even when the target
-            # table doesn't exist yet.
+            # Log instructions for incremental transforms.
+            # The Metabase API for source-incremental-strategy requires
+            # column-unique-key references that are only available after the
+            # output table is synced, and the API format is actively changing.
+            # For now, we log clear instructions to set this in the UI.
             for name, tid in layer_transforms:
                 t_meta = incremental_ids.get(tid)
                 if t_meta:
-                    try:
-                        self.client.upgrade_to_incremental(
-                            tid, t_meta.checkpoint_column,
-                        )
-                        logger.info(
-                            "Transform '%s' upgraded to incremental "
-                            "(checkpoint=%s)", name, t_meta.checkpoint_column,
-                        )
-                    except MetabaseApiError as e:
-                        self.plan.warnings.append(
-                            "[{}] Failed to upgrade to incremental: {}".format(
-                                name, e
-                            )
-                        )
-                        logger.warning(
-                            "Failed to upgrade '%s' to incremental: %s", name, e
-                        )
+                    msg = (
+                        "[{}] ACTION REQUIRED: Set checkpoint column '{}' "
+                        "in Metabase UI -> Data Studio -> Transforms -> {} "
+                        "-> Settings -> 'Column to check for new values'"
+                    ).format(name, t_meta.checkpoint_column, name)
+                    self.plan.warnings.append(msg)
+                    logger.warning(msg)
 
             logger.info("Layer %d/%d complete", layer_idx + 1, total_layers)
 
@@ -536,24 +559,16 @@ class Migrator:
 
     def _snapshot_for_validation(self):
         # type: () -> None
-        """Capture dbt-produced table state in their ORIGINAL schemas.
-
-        Since transforms write to transforms_* schemas, the original dbt
-        tables are untouched.  We snapshot them so we can compare later.
-        """
         assert self.plan is not None
 
         self.validator = DataValidator(self.client, self.config.metabase.database_id)
 
         prefix = self.config.transform_schema_prefix
 
-        # Build pairs: (dbt_schema, table_name), (transform_schema, table_name)
         self._validation_pairs = []  # type: List[tuple]
         for t in self.plan.transforms:
             if not t.transform_id:
                 continue
-            # t.schema_name is the transform schema (e.g. transforms_staging)
-            # Strip prefix to get the dbt schema (e.g. staging)
             dbt_schema = t.schema_name
             if prefix and dbt_schema.startswith(prefix):
                 dbt_schema = dbt_schema[len(prefix):]
@@ -565,15 +580,13 @@ class Migrator:
             logger.warning("No transforms to validate (none created)")
             return
 
-        # Snapshot the dbt side
         dbt_tables = [pair[0] for pair in self._validation_pairs]
         self.validator.snapshot_tables(dbt_tables)
 
     def _validate_transforms(self):
         # type: () -> ValidationReport
-        """Compare transform output against dbt tables (cross-schema)."""
         if not self.validator or not getattr(self, '_validation_pairs', None):
-            logger.warning("No validator available — skipping validation")
+            logger.warning("No validator available -- skipping validation")
             return ValidationReport()
 
         report = self.validator.validate_cross_schema(self._validation_pairs)
@@ -582,61 +595,59 @@ class Migrator:
 
     def run_validate_only(self, pre_snapshots_schema_map=None):
         # type: (Optional[Dict[str, str]]) -> ValidationReport
-        """Standalone validation: compare dbt tables against transform tables.
-
-        Snapshots each model's dbt table (original schema) and compares it
-        against the corresponding transform table (transforms_* schema).
-        Seeds are skipped since they are not created as transforms.
-        """
+        """Standalone validation: compare dbt tables against transform tables."""
         logger.info("=" * 60)
         logger.info("dbt -> Metabase Transforms: VALIDATE")
         logger.info("=" * 60)
 
-        logger.info("Step 1/3: Parsing dbt project from GitHub...")
-        self.project = self.parser.parse()
-
-        logger.info("Step 2/3: Building table list...")
-        resolver = DependencyResolver(self.project)
         try:
-            execution_order = resolver.resolve(exclude_seeds_only=True)
-        except CyclicDependencyError as e:
-            raise MigrationError("Cannot validate: {}".format(e))
+            logger.info("Step 1/3: Compiling and parsing dbt project...")
+            manifest_path = self.compiler.compile()
+            parser = ManifestParser(manifest_path)
+            self.project = parser.parse()
 
-        model_lookup = {m.name: m for m in self.project.models.values()}
+            logger.info("Step 2/3: Building table list...")
+            resolver = DependencyResolver(self.project)
+            try:
+                execution_order = resolver.resolve(exclude_seeds_only=True)
+            except CyclicDependencyError as e:
+                raise MigrationError("Cannot validate: {}".format(e))
 
-        # Build the dbt→transform schema mapping
-        prefix = self.config.transform_schema_prefix
-        schema_overrides = {}  # type: Dict[str, str]
-        for mapping in self.config.schema_mappings:
-            schema_overrides[mapping.dbt_folder_pattern] = "{}{}".format(
-                prefix, mapping.metabase_schema
-            )
+            model_lookup = {m.name: m for m in self.project.models.values()}
 
-        # Build cross-schema pairs: (dbt_schema, table) vs (transforms_schema, table)
-        table_pairs = []  # type: List[tuple]
-        for model_name in execution_order:
-            model = model_lookup.get(model_name)
-            if not model or model.config.get("is_seed"):
-                continue
+            prefix = self.config.transform_schema_prefix
+            schema_overrides = {}  # type: Dict[str, str]
+            for mapping in self.config.schema_mappings:
+                schema_overrides[mapping.dbt_folder_pattern] = "{}{}".format(
+                    prefix, mapping.metabase_schema
+                )
 
-            transform_schema = self._resolve_schema(model, schema_overrides)
-            # Strip prefix to get original dbt schema
-            dbt_schema = transform_schema
-            if prefix and dbt_schema.startswith(prefix):
-                dbt_schema = dbt_schema[len(prefix):]
+            table_pairs = []  # type: List[tuple]
+            for model_name in execution_order:
+                model = model_lookup.get(model_name)
+                if not model or model.config.get("is_seed"):
+                    continue
 
-            table_pairs.append(
-                ((dbt_schema, model.name), (transform_schema, model.name))
-            )
+                transform_schema = self._resolve_schema(model, schema_overrides)
+                dbt_schema = transform_schema
+                if prefix and dbt_schema.startswith(prefix):
+                    dbt_schema = dbt_schema[len(prefix):]
 
-        logger.info("Step 3/3: Validating %d tables (dbt vs transforms)...", len(table_pairs))
+                table_pairs.append(
+                    ((dbt_schema, model.name), (transform_schema, model.name))
+                )
 
-        validator = DataValidator(self.client, self.config.metabase.database_id)
-        report = validator.validate_cross_schema(table_pairs)
-        print(validator.format_report(report))
+            logger.info("Step 3/3: Validating %d tables (dbt vs transforms)...", len(table_pairs))
 
-        self.validation_report = report
-        return report
+            validator = DataValidator(self.client, self.config.metabase.database_id)
+            report = validator.validate_cross_schema(table_pairs)
+            print(validator.format_report(report))
+
+            self.validation_report = report
+            return report
+
+        finally:
+            self.compiler.cleanup()
 
     def _get_existing_transforms(self):
         # type: () -> Dict[str, dict]
@@ -721,22 +732,13 @@ class Migrator:
 
     def run_remap(self):
         # type: () -> Dict[str, Any]
-        """
-        Remap Metabase cards from dbt model tables to Metabase transform tables.
-
-        Steps:
-        1. List all tables in the target database
-        2. Build table ID mapping: dbt table -> transform table (by name)
-        3. Find all cards referencing dbt tables
-        4. Update each card's query to reference transform tables instead
-        """
+        """Remap Metabase cards from dbt model tables to Metabase transform tables."""
         logger.info("=" * 60)
         logger.info("dbt -> Metabase Transforms: REMAP")
         logger.info("=" * 60)
 
         remap_map = self.config.remap_schema_map
         if not remap_map:
-            # Auto-derive from schema_mappings + transform_schema_prefix
             prefix = self.config.transform_schema_prefix
             if self.config.schema_mappings and prefix:
                 remap_map = {}
@@ -744,7 +746,6 @@ class Migrator:
                     dbt_schema = mapping.metabase_schema
                     transform_schema = "{}{}".format(prefix, dbt_schema)
                     remap_map[dbt_schema] = transform_schema
-                # Also include the default schema
                 default = self.config.metabase.default_schema
                 if default and default not in remap_map:
                     remap_map[default] = "{}{}".format(prefix, default)
@@ -1042,7 +1043,12 @@ class Migrator:
                 if isinstance(item, (list, dict)):
                     if self._remap_field_ids(item, field_id_map):
                         changed = True
-                elif isinstance(item, int) and i > 0 and obj[0] == "field" and item in field_id_map:
+                elif (
+                    isinstance(item, int)
+                    and i > 0
+                    and obj[0] == "field"
+                    and item in field_id_map
+                ):
                     obj[i] = field_id_map[item]
                     changed = True
 

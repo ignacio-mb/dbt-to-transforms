@@ -49,9 +49,11 @@ class DbtModel:
     name: str
     path: str
     raw_sql: str
+    compiled_sql: str = ""
     materialization: DbtMaterialization = DbtMaterialization.TABLE
     schema_name: Optional[str] = None
     database: Optional[str] = None
+    alias: Optional[str] = None
     tags: List[str] = field(default_factory=list)
     description: str = ""
     columns: List[DbtModelColumn] = field(default_factory=list)
@@ -67,6 +69,11 @@ class DbtModel:
     @property
     def is_incremental(self) -> bool:
         return self.materialization == DbtMaterialization.INCREMENTAL
+
+    @property
+    def table_name(self) -> str:
+        """The actual table/view name in the database (respects alias)."""
+        return self.alias or self.name
 
 
 @dataclass
