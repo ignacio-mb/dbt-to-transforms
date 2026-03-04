@@ -186,6 +186,15 @@ class Migrator:
                 )
                 continue
 
+            # Snapshots are SCD2 tables managed by `dbt snapshot` -- skip them.
+            # They already exist in the database and downstream models reference
+            # them via their original schema (e.g. dbt_models_snapshot.*).
+            if model.config.get("is_snapshot"):
+                plan.skipped_models.append(
+                    (model.name, "Snapshot (SCD2) -- managed by dbt, not migrated")
+                )
+                continue
+
             # Log informational warnings for non-table materializations
             if model.materialization == DbtMaterialization.VIEW:
                 plan.warnings.append(
@@ -625,7 +634,7 @@ class Migrator:
             table_pairs = []  # type: List[tuple]
             for model_name in execution_order:
                 model = model_lookup.get(model_name)
-                if not model or model.config.get("is_seed"):
+                if not model or model.config.get("is_seed") or model.config.get("is_snapshot"):
                     continue
 
                 transform_schema = self._resolve_schema(model, schema_overrides)

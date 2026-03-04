@@ -84,7 +84,8 @@ class DependencyResolver:
             order = [
                 m for m in order
                 if not (self._model_by_name.get(m) and
-                        self._model_by_name[m].config.get("is_seed"))
+                        (self._model_by_name[m].config.get("is_seed") or
+                         self._model_by_name[m].config.get("is_snapshot")))
             ]
 
         return order
@@ -131,8 +132,8 @@ class DependencyResolver:
             if not model:
                 continue
 
-            # Seeds are already excluded from *order* but guard anyway.
-            if model.config.get("is_seed"):
+            # Seeds and snapshots are already excluded from *order* but guard anyway.
+            if model.config.get("is_seed") or model.config.get("is_snapshot"):
                 continue
 
             deps = [
