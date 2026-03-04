@@ -43,14 +43,17 @@ class ManifestParser:
         self._extract_models(manifest, project)
         self._extract_sources(manifest, project)
         self._extract_seeds(manifest, project)
+        self._extract_snapshots(manifest, project)
         self._resolve_dependencies(project)
 
         seed_count = len([m for m in project.models.values() if m.config.get("is_seed")])
-        model_count = len(project.models) - seed_count
+        snapshot_count = len([m for m in project.models.values() if m.config.get("is_snapshot")])
+        model_count = len(project.models) - seed_count - snapshot_count
         logger.info(
-            "Parsed %d models, %d seeds, and %d sources from manifest (project '%s')",
+            "Parsed %d models, %d seeds, %d snapshots, and %d sources from manifest (project '%s')",
             model_count,
             seed_count,
+            snapshot_count,
             len(project.sources),
             project.name,
         )
@@ -186,6 +189,49 @@ class ManifestParser:
             project.models[node["unique_id"]] = model
             logger.info("Registered seed '%s' -> %s.%s", node["name"], seed_schema, node["name"])
 
+    def _extract_snapshots(self, manifest, project):
+        # type: (dict, DbtProject) -> None
+        """Register dbt snapshots as read-only table references.
+
+        Snapshots are SCD2 tables managed by ``dbt snapshot``.  They already
+        exist in the database and should NOT be converted to Metabase
+        transforms.  We register them in the dependency graph so that
+        downstream models that ``ref('snapshot_xxx')`` can resolve correctly.
+        """
+        nodes = manifest.get("nodes", {})
+
+        for node_id, node in nodes.items():
+            if node.get("resource_type") != "snapshot":
+                continue
+
+            # Don't overwrite if a model with the same name exists
+            if any(m.name == node["name"] for m in project.models.values()):
+                logger.debug("Snapshot '%s' shadowed by existing model, skipping", node["name"])
+                continue
+
+            snapshot_schema = node.get("schema", "snapshots")
+
+            model = DbtModel(
+                unique_id=node["unique_id"],
+                name=node["name"],
+                path=node.get("original_file_path", node.get("path", "")),
+                raw_sql=node.get("raw_sql", node.get("raw_code", "")),
+                compiled_sql="",  # Not needed — we don't create a transform
+                materialization=DbtMaterialization.TABLE,
+                schema_name=snapshot_schema,
+                database=node.get("database"),
+                alias=node.get("alias"),
+                tags=node.get("tags", []),
+                description=node.get("description", "dbt snapshot: {}".format(node["name"])),
+                config={"is_snapshot": True},
+                folder="",
+            )
+            project.models[node["unique_id"]] = model
+            logger.info(
+                "Registered snapshot '%s' -> %s.%s (SCD2, managed by dbt)",
+                node["name"], snapshot_schema, node["name"],
+            )
+
     def _parse_columns(self, node):
         # type: (dict) -> List[DbtModelColumn]
         columns = []
@@ -210,9 +256,10 @@ class ManifestParser:
         """Extract model dependency names from depends_on.nodes."""
         deps = []
         for dep_id in node.get("depends_on", {}).get("nodes", []):
-            # dep_id looks like "model.project.model_name" or "seed.project.seed_name"
+            # dep_id looks like "model.project.model_name", "seed.project.seed_name",
+            # or "snapshot.project.snapshot_name"
             parts = dep_id.split(".")
-            if len(parts) >= 3 and parts[0] in ("model", "seed"):
+            if len(parts) >= 3 and parts[0] in ("model", "seed", "snapshot"):
                 deps.append(parts[-1])
         return deps
 
